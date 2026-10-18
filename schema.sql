@@ -76,6 +76,11 @@ create table public.assinaturas (
   updated_at        timestamptz not null default now()
 );
 
+-- Evita que requisições simultâneas iniciem assinaturas concorrentes para a mesma conta.
+create unique index assinaturas_uma_corrente_por_usuario
+  on public.assinaturas (user_id)
+  where status in ('pendente','ativa','pausada');
+
 -- 7. Pagamentos recebidos (para faturamento do mês no painel admin)
 create table public.pagamentos (
   id             uuid primary key default gen_random_uuid(),
@@ -110,7 +115,7 @@ language sql stable security definer set search_path = public as $$
   select (uid = auth.uid() or public.is_admin())
       and (exists (select 1 from public.profiles p where p.id = uid and p.trial_ends_at > now())
       or exists (select 1 from public.assinaturas a where a.user_id = uid
-                 and a.status = 'ativa' and (a.periodo_fim is null or a.periodo_fim > now())));
+                 and a.status = 'ativa' and a.periodo_fim > now()));
 $$;
 
 -- RLS

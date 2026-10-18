@@ -4,8 +4,10 @@ const WA_NUM='5565993085010', WA_SHOW='(65) 99308-5010', WA_MSG='Olá, preciso d
 const WA_URL='https://wa.me/'+WA_NUM+'?text='+encodeURIComponent(WA_MSG);
 const cfg=window.ROTINA_SUPABASE_CONFIG;
 const sb=window.supabase&&cfg?window.supabase.createClient(cfg.url,cfg.publishableKey):null;
+const paymentsEnabled=cfg?.paymentsEnabled===true;
 let cloudUser=null,cloudProfile=null,cloudChild=null,cloudBoards={},cloudReady=false,saveQueue=Promise.resolve();
 let mediaSlots=new Map(),mediaValues=new Map(),storedMediaPaths=new Set();
+let paymentBusy=false;
 function save(){
   if(!cloudReady||!S){toast('A conta ainda não está conectada. Tente novamente.');return}
   const snapshot=JSON.parse(JSON.stringify(S));
@@ -117,9 +119,9 @@ async function loadCloudState(user){
     const inserted=failOnError(await sb.from('quadros').insert(missing.map(tipo=>({user_id:user.id,crianca_id:child.id,tipo,nome:names[tipo],config:initial[tipo]}))).select('id,tipo,nome,config'));
     for(const row of inserted)cloudBoards[row.tipo]=row;
   }
-  const subscriptions=failOnError(await sb.from('assinaturas').select('plano,status,created_at,periodo_fim').eq('user_id',user.id).eq('status','ativa').order('created_at',{ascending:false}).limit(1));
-  const subscription=subscriptions[0];
-  const active=subscription&&(!subscription.periodo_fim||new Date(subscription.periodo_fim).getTime()>Date.now())?subscription:null;
+  const subscriptions=failOnError(await sb.from('assinaturas').select('plano,status,created_at,periodo_fim,cancelada_em').eq('user_id',user.id).order('created_at',{ascending:false}).limit(1));
+  const subscription=subscriptions[0]||null;
+  const active=subscription&&subscription.status==='ativa'&&subscription.periodo_fim&&new Date(subscription.periodo_fim).getTime()>Date.now()?subscription:null;
   const configs=Object.fromEntries(Object.entries(cloudBoards).map(([type,row])=>[type,row.config||{}]));
   S={...base,
     routine:Array.isArray(configs.rotina.routine)?configs.rotina.routine:base.routine,
@@ -128,7 +130,7 @@ async function loadCloudState(user){
     feelAudio:configs.sentimentos.feelAudio||{},
     helps:Array.isArray(configs.escala.helps)?configs.escala.helps:base.helps,
     scalePick:Number(configs.escala.scalePick)||base.scalePick,
-    plan:active?.plano||null,planAt:active?.created_at?new Date(active.created_at).getTime():null
+    plan:active?.plano||null,planAt:active?.created_at?new Date(active.created_at).getTime():null,subscription
   };
   for(const item of S.routine){
     item.photo=await loadMedia(item.photo,`rotina/${item.id}/foto`);
@@ -187,6 +189,38 @@ function readFile(file,cb){if(!file)return;const r=new FileReader();r.onload=()=
 function readImage(file,cb){if(!file)return;const r=new FileReader();r.onload=()=>{const img=new Image();img.onload=()=>{const m=360,s=Math.min(1,m/Math.max(img.width,img.height)),c=document.createElement('canvas');c.width=img.width*s;c.height=img.height*s;c.getContext('2d').drawImage(img,0,0,c.width,c.height);cb(c.toDataURL('image/jpeg',.82))};img.src=r.result};r.readAsDataURL(file)}
 
 function toast(m){toastMsg=m;clearTimeout(toastT);toastT=setTimeout(()=>{toastMsg='';const el=document.querySelector('.toast');if(el)el.remove()},3200);const el=document.querySelector('.toast');if(el)el.textContent=m;else document.body.insertAdjacentHTML('beforeend','<div class="toast" role="status">'+esc(m)+'</div>')}
+async function refreshSubscription(){
+  const rows=failOnError(await sb.from('assinaturas').select('plano,status,created_at,periodo_fim,cancelada_em').eq('user_id',cloudUser.id).order('created_at',{ascending:false}).limit(1));
+  S.subscription=rows[0]||null;
+  const sub=S.subscription;
+  S.plan=sub?.status==='ativa'&&sub.periodo_fim&&new Date(sub.periodo_fim).getTime()>Date.now()?sub.plano:null;
+  S.planAt=S.plan&&sub?.created_at?new Date(sub.created_at).getTime():null;
+}
+async function startCheckout(plan){
+  if(!paymentsEnabled){toast('O checkout ainda não foi ativado. Fale com o suporte para saber quando estará disponível.');return}
+  if(paymentBusy)return;
+  paymentBusy=true;render();
+  try{
+    const {data,error}=await sb.functions.invoke('criar-assinatura',{body:{plano:plan}});
+    if(error)throw error;
+    if(!data?.checkoutUrl)throw new Error(data?.error||'O checkout não foi iniciado. Tente novamente.');
+    const checkout=new URL(data.checkoutUrl);
+    if(checkout.protocol!=='https:'||!/(^|\.)mercadopago\.com(\.br)?$/i.test(checkout.hostname))throw new Error('O Mercado Pago retornou um endereço de checkout inválido.');
+    window.location.assign(checkout.toString());
+  }catch(error){paymentBusy=false;render();toast(error.message||'Não foi possível iniciar o pagamento.')}
+}
+async function cancelSubscription(){
+  const pending=S.subscription?.status==='pendente';
+  if(!window.confirm(pending?'Deseja cancelar este pagamento pendente?':'Deseja cancelar sua assinatura? O acesso seguirá disponível até o fim do período já pago.'))return;
+  paymentBusy=true;render();
+  try{
+    const {data,error}=await sb.functions.invoke('cancelar-assinatura',{body:{}});
+    if(error)throw error;
+    await refreshSubscription();
+    toast(pending?'Pagamento pendente cancelado.':'Assinatura cancelada. Você mantém o acesso até o fim do período pago.');
+  }catch(error){toast(error.message||'Não foi possível cancelar a assinatura.')}
+  finally{paymentBusy=false;render()}
+}
 
 const pic=(x,cls='')=>'<div class="pic '+cls+'" aria-hidden="true">'+(x.photo?'<img alt="" src="'+x.photo+'">':esc(x.e))+'</div>';
 
@@ -325,21 +359,25 @@ function viewEscala(){
 
 function viewPlanos(){
   const d=daysLeft();
+  const sub=S.subscription;
+  const paymentPending=sub?.status==='pendente';
+  const planBlocked=!paymentsEnabled||!!S.plan||paymentPending||sub?.status==='pausada'||paymentBusy;
+  const button=(plan,label)=>`<button class="btn ${plan==='anual'?'primary ':''}block big" data-act="checkout-${plan}" ${planBlocked?'disabled':''}>${paymentBusy?'Abrindo checkout…':S.plan===plan?'Plano atual':paymentPending?'Pagamento pendente':sub?.status==='pausada'?'Assinatura pausada':paymentsEnabled?label:'Pagamento em ativação'}</button>`;
   return `<div class="stack" style="gap:20px"><div><h1>Planos</h1><p class="muted">${S.plan?'Você já é assinante. Obrigada por apoiar o Rotina Atípica.':d>0?`Você ainda tem ${d} ${d===1?'dia':'dias'} de teste grátis.`:'Seu teste grátis terminou; seus dados continuam guardados.'}</p></div>
   <div class="plans">
    <div class="card plan stack"><div><p class="eyebrow">Mensal</p><p class="price">R$ 14,90<span class="muted small" style="font-family:var(--f-body)"> /mês</span></p></div>
      <ul class="ticks"><li>Todos os quadros</li><li>Fotos e voz própria nos cartões</li><li>Celular, tablet e computador</li><li>Cancele quando quiser</li></ul>
-     <button class="btn block big" disabled>${S.plan==='mensal'?'Plano atual':'Pagamento em configuração'}</button></div>
+     ${button('mensal','Assinar plano mensal')}</div>
    <div class="card plan best stack"><div class="row" style="justify-content:space-between"><p class="eyebrow">Anual</p><span class="chip ok">Economize 33%</span></div><div><p class="price">R$ 119,90<span class="muted small" style="font-family:var(--f-body)"> /ano</span></p><p class="muted small">Equivale a R$ 9,99 por mês</p></div>
      <ul class="ticks"><li>Tudo do plano mensal</li><li>R$ 58,90 a menos no ano</li><li>Uma cobrança por ano</li></ul>
-     <button class="btn primary block big" disabled>${S.plan==='anual'?'Plano atual':'Pagamento em configuração'}</button></div>
+     ${button('anual','Assinar plano anual')}</div>
   </div>
-  <p class="muted small">A integração de pagamentos ainda não está ativa. Nenhuma cobrança pode ser feita por esta tela. Dúvidas: <a href="${WA_URL}" target="_blank" rel="noopener">WhatsApp ${WA_SHOW}</a>.</p></div>`;
+  <p class="muted small">${paymentsEnabled?'O pagamento é processado com segurança pelo Mercado Pago.':'O checkout será habilitado após a configuração segura do Mercado Pago.'} Dúvidas: <a href="${WA_URL}" target="_blank" rel="noopener">WhatsApp ${WA_SHOW}</a>.</p></div>`;
 }
 function viewPaywall(){
   return `<div class="card stack" style="max-width:620px;margin:20px auto;text-align:center;align-items:center"><div style="font-size:4rem">🔒</div><h1>O teste grátis terminou</h1>
-  <p class="muted">A rotina de ${esc(S.user.child)} continua guardada. Os pagamentos ainda estão sendo configurados; fale com o suporte para saber quando o acesso poderá ser retomado.</p>
-  <div class="row" style="justify-content:center"><a class="btn" href="${WA_URL}" target="_blank" rel="noopener">💬 Falar com a gente</a></div></div>`;
+  <p class="muted">A rotina de ${esc(S.user.child)} continua guardada. ${paymentsEnabled?'Assine um plano para continuar usando os quadros.':'Os pagamentos ainda estão sendo configurados; fale com o suporte para saber quando o acesso poderá ser retomado.'}</p>
+  <div class="row" style="justify-content:center">${paymentsEnabled?'<button class="btn primary" data-go="planos">Ver planos</button>':''}<a class="btn" href="${WA_URL}" target="_blank" rel="noopener">💬 Falar com a gente</a></div></div>`;
 }
 
 function viewAjuda(){
@@ -349,7 +387,7 @@ function viewAjuda(){
   <div class="card stack"><h3>Perguntas comuns</h3>
    <p><strong>Como gravo minha voz num cartão?</strong><br><span class="muted">Na Rotina, toque em “Editar rotina”, depois no lápis do passo e em “Gravar agora”. No celular, “Escolher áudio” também abre o gravador.</span></p>
    <p><strong>A criança pode mexer sem bagunçar?</strong><br><span class="muted">Sim. Use “Mostrar para a criança”: os botões de edição somem e, para sair, é preciso segurar o cadeado.</span></p>
-   <p><strong>O que acontece depois dos 7 dias?</strong><br><span class="muted">Seus quadros continuam guardados. A cobrança ainda está sendo configurada; fale com o suporte para saber sobre a retomada do acesso.</span></p></div></div>`;
+   <p><strong>O que acontece depois dos 7 dias?</strong><br><span class="muted">Seus quadros continuam guardados. ${paymentsEnabled?'Escolha um plano para continuar usando a plataforma.':'A cobrança ainda está sendo configurada; fale com o suporte para saber sobre a retomada do acesso.'}</span></p></div></div>`;
 }
 
 function viewPrivacidade(){
@@ -358,7 +396,7 @@ function viewPrivacidade(){
   <h3>Que dados coletamos</h3><p>Da responsável: nome, e-mail e senha (guardada de forma criptografada). Da criança: apenas o nome ou apelido e, se você quiser, fotos e gravações de voz colocadas nos cartões. Não pedimos data de nascimento, diagnóstico, escola ou documentos.</p>
   <h3>Para que usamos</h3><p>Somente para fazer os quadros funcionarem e para controlar a assinatura. Não vendemos nem compartilhamos dados para publicidade.</p>
   <h3>Dados de crianças (LGPD, art. 14)</h3><p>Os dados da criança são tratados no melhor interesse dela e com o consentimento da mãe, pai ou responsável legal, dado no cadastro. Fotos e áudios ficam visíveis só para a sua conta.</p>
-  <h3>Pagamentos</h3><p>A integração de pagamentos ainda não está ativa. Quando estiver disponível, os dados do cartão serão tratados pelo Mercado Pago; o Rotina Atípica não receberá nem guardará o número do cartão.</p>
+  <h3>Pagamentos</h3><p>${paymentsEnabled?'Os pagamentos são processados pelo Mercado Pago; o Rotina Atípica não recebe nem guarda o número do cartão.':'A integração de pagamentos ainda não está ativa. Quando estiver disponível, os dados do cartão serão tratados pelo Mercado Pago; o Rotina Atípica não receberá nem guardará o número do cartão.'}</p>
   <h3>Seus direitos</h3><p>Você pode ver, corrigir, baixar ou apagar seus dados e os da criança a qualquer momento, em “Minha conta” ou pelo WhatsApp ${WA_SHOW}.</p>
   <h3>Termos de uso</h3><p>O Rotina Atípica é uma ferramenta de apoio à organização da rotina e não substitui acompanhamento terapêutico ou médico. O teste grátis dura 7 dias a partir do cadastro. As opções de assinatura e cobrança ainda estão em configuração.</p>
   <h3>Pictogramas</h3><p>Nesta demonstração os cartões usam emojis. A versão final pode usar pictogramas ARASAAC, com o crédito exigido: “Autor dos pictogramas: Sergio Palao. Origem: ARASAAC (arasaac.org). Licença: CC BY-NC-SA. Propriedade: Governo de Aragão (Espanha)”.</p>
@@ -373,7 +411,11 @@ function viewConta(){
    <div class="seg" role="group" aria-label="Gênero da criança"><button type="button" id="ac-m" data-g2="m" aria-pressed="${!gi()}" ${hasAccess()?'':'disabled'}>Menino</button><button type="button" id="ac-f" data-g2="f" aria-pressed="${!!gi()}" ${hasAccess()?'':'disabled'}>Menina</button></div>
    <button class="btn primary" data-act="save-acct">Salvar</button></div>
   <div class="card stack"><h3>Assinatura</h3><p>${S.plan?`Plano ${S.plan}, desde ${new Date(S.planAt).toLocaleDateString('pt-BR')}.`:daysLeft()>0?`Teste grátis: ${daysLeft()} ${daysLeft()===1?'dia restante':'dias restantes'}.`:'Teste grátis encerrado.'}</p>
-   ${S.plan?'<p class="muted small">Para alterar ou cancelar o plano, fale com o suporte.</p>':'<button class="btn primary" data-go="planos">Ver planos</button>'}</div>
+   ${S.subscription?.status==='pendente'?'<p class="muted small">Aguardando confirmação do Mercado Pago.</p><button class="btn" data-act="refresh-subscription">Atualizar status</button>':''}
+   ${S.subscription?.status==='pausada'?'<p class="muted small">Sua assinatura está pausada. Entre em contato com o suporte para retomá-la ou cancelá-la.</p>':''}
+   ${S.plan&&S.subscription?.cancelada_em?`<p class="muted small">Cancelamento solicitado. Seu acesso continua até ${S.subscription.periodo_fim?new Date(S.subscription.periodo_fim).toLocaleDateString('pt-BR'):'o fim do período pago'}.</p>`:''}
+   ${(S.plan&&!S.subscription?.cancelada_em)||S.subscription?.status==='pendente'?`<button class="btn danger" data-act="cancel-subscription" ${paymentBusy?'disabled':''}>${S.subscription?.status==='pendente'?'Cancelar pagamento pendente':'Cancelar assinatura'}</button>`:''}
+   ${!S.plan&&S.subscription?.status!=='pendente'&&S.subscription?.status!=='pausada'?'<button class="btn primary" data-go="planos">Ver planos</button>':''}</div>
   <div class="card stack"><h3>Mais</h3><div class="row"><button class="btn" data-go="ajuda">Ajuda</button><button class="btn" data-go="privacidade">Privacidade e termos</button><button class="btn" data-go="admin">Painel admin</button></div></div>
   <div class="card stack"><h3>Apagar meus dados</h3><p class="muted small">A exclusão automática da conta e dos arquivos ainda não está configurada. Peça a exclusão pelo canal de suporte para que seus dados sejam removidos corretamente.</p>
    <a class="btn danger" href="${WA_URL}" target="_blank" rel="noopener">Solicitar exclusão pelo WhatsApp</a></div>
@@ -527,6 +569,10 @@ document.addEventListener('click',e=>{
    'edit-helps':()=>{modal={type:'helps'};render()},
    'save-helps':()=>{S.helps[S.scalePick-1]=document.getElementById('hp-text').value.split('\n').map(s=>s.trim()).filter(Boolean);save();modal=null;render();toast('Salvo.')},
    'save-acct':()=>{const v=id=>document.getElementById(id).value.trim();S.user.name=v('ac-name')||S.user.name;if(hasAccess())S.user.child=v('ac-child')||S.user.child;save();render();toast('Dados salvos.')},
+   'checkout-mensal':()=>startCheckout('mensal'),
+   'checkout-anual':()=>startCheckout('anual'),
+   'cancel-subscription':()=>cancelSubscription(),
+   'refresh-subscription':async()=>{try{await refreshSubscription();render();toast('Status da assinatura atualizado.')}catch(error){toast('Não foi possível atualizar: '+esc(error.message||error))}},
    'sign-out':async()=>{try{await saveQueue;const {error}=await sb.auth.signOut();if(error)throw error}catch(error){toast('Não foi possível sair: '+esc(error.message||error))}},
    'copy-wa':()=>{navigator.clipboard.writeText(WA_SHOW).then(()=>toast('Número copiado.')).catch(()=>toast('Selecione o número para copiar.'))},
   }[a]||(()=>{}))();
