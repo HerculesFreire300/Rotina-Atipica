@@ -227,7 +227,7 @@ textarea.input{padding:12px 16px;min-height:120px;resize:vertical}
 .welcome > .stack > :nth-child(3){animation-delay:.21s}
 .welcome > .stack > :nth-child(4){animation-delay:.29s}
 .welcome > .stack > :nth-child(5){animation-delay:.37s}
-.welcome > .signup{animation:welcome-rise .7s cubic-bezier(.2,.7,.25,1) .2s both}
+.welcome > .auth-panel{animation:welcome-rise .7s cubic-bezier(.2,.7,.25,1) .2s both}
 @keyframes welcome-rise{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
 .welcome h1{font-size:clamp(2.2rem,5.2vw,3.4rem);line-height:1.05}
 .welcome h1 em{font-style:normal;color:var(--h-rotina);background:linear-gradient(transparent 62%,var(--t-rotina) 62%)}
@@ -242,6 +242,7 @@ textarea.input{padding:12px 16px;min-height:120px;resize:vertical}
 .feat{display:flex;flex-wrap:wrap;gap:8px;max-width:480px}
 .feat span{display:inline-flex;gap:6px;align-items:center;font-weight:700;font-size:.9rem;padding:8px 14px;border-radius:999px;background:var(--surface);box-shadow:var(--shadow-sm)}
 .signup{padding:28px}
+.auth-panel{display:grid;gap:16px;align-self:center}
 
 /* planos */
 .plans{display:grid;grid-template-columns:1fr;gap:18px}

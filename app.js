@@ -1,10 +1,16 @@
 (function(){
-const KEY='rotina-atipica:v1', DAY=86400000, TRIAL=7;
+const DAY=86400000;
 const WA_NUM='5565993085010', WA_SHOW='(65) 99308-5010', WA_MSG='Olá, preciso de ajuda com o Rotina Atípica';
 const WA_URL='https://wa.me/'+WA_NUM+'?text='+encodeURIComponent(WA_MSG);
-let mem=null;
-function load(){try{const v=localStorage.getItem(KEY);return v?JSON.parse(v):mem}catch(e){return mem}}
-function save(){mem=S;try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){if(e&&(e.name==='QuotaExceededError'||e.code===22))toast('O navegador está sem espaço. Use áudios mais curtos.')}}
+const cfg=window.ROTINA_SUPABASE_CONFIG;
+const sb=window.supabase&&cfg?window.supabase.createClient(cfg.url,cfg.publishableKey):null;
+let cloudUser=null,cloudProfile=null,cloudChild=null,cloudBoards={},cloudReady=false,saveQueue=Promise.resolve();
+let mediaSlots=new Map(),mediaValues=new Map(),storedMediaPaths=new Set();
+function save(){
+  if(!cloudReady||!S){toast('A conta ainda não está conectada. Tente novamente.');return}
+  const snapshot=JSON.parse(JSON.stringify(S));
+  saveQueue=saveQueue.then(()=>persistCloud(snapshot)).catch(e=>toast('Não foi possível salvar no Supabase: '+esc(e.message||e)));
+}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const LOGO='<span class="logo" aria-hidden="true"><img src="logo-autismo.png" alt=""></span>';
 const uid=()=>Math.random().toString(36).slice(2,9);
@@ -29,12 +35,132 @@ function fresh(u){
     routine:[['Acordar','🌅'],['Ir ao banheiro','🚽'],['Escovar os dentes','🪥'],['Café da manhã','🥣'],['Vestir a roupa','👕'],['Escola','🏫']].map(([t,e])=>({id:uid(),t,e,photo:null,audio:null,done:false})),
     waitMin:5,waitPick:null,feelAudio:{},helps:SCALE.map(s=>s.h.slice()),scalePick:3};
 }
-let S=load();
-let view='home', kid=false, editing=false, modal=null, toastMsg='', toastT=0, checkoutPlan=null, adminOk=false, confirmWipe=false;
+
+function failOnError(result){if(result.error)throw result.error;return result.data}
+function dataUrl(blob){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(reader.error||new Error('Não foi possível ler a mídia.'));reader.readAsDataURL(blob)})}
+async function saveMedia(value,slot,paths){
+  if(!value)return null;
+  if(value.startsWith('storage://')){const path=value.slice(10);paths.add(path);return value}
+  if(!value.startsWith('data:'))throw new Error('Formato de mídia não reconhecido.');
+  if(mediaValues.get(slot)===value&&mediaSlots.has(slot)){paths.add(mediaSlots.get(slot));return 'storage://'+mediaSlots.get(slot)}
+  const path=mediaSlots.get(slot)||`${cloudUser.id}/${slot}`;
+  const blob=await (await fetch(value)).blob();
+  failOnError(await sb.storage.from('midia').upload(path,blob,{upsert:true,contentType:blob.type}));
+  mediaSlots.set(slot,path);mediaValues.set(slot,value);paths.add(path);
+  return 'storage://'+path;
+}
+async function loadMedia(value,slot){
+  if(!value||!value.startsWith('storage://'))return value||null;
+  const path=value.slice(10);
+  const {data,error}=await sb.storage.from('midia').download(path);
+  if(error)throw error;
+  mediaSlots.set(slot,path);storedMediaPaths.add(path);
+  const loaded=await dataUrl(data);mediaValues.set(slot,loaded);return loaded;
+}
+async function persistCloud(state){
+  if(!cloudUser||!cloudChild)throw new Error('A sessão da conta não está pronta.');
+  failOnError(await sb.from('profiles').update({nome:state.user.name}).eq('id',cloudUser.id).select('id').single());
+  if(!state.plan&&new Date(cloudProfile.trial_ends_at).getTime()<=Date.now())return;
+  const mediaPaths=new Set(),routine=[];
+  for(const item of state.routine){
+    routine.push({...item,
+      photo:await saveMedia(item.photo,`rotina/${item.id}/foto`,mediaPaths),
+      audio:await saveMedia(item.audio,`rotina/${item.id}/audio`,mediaPaths)
+    });
+  }
+  const feelAudio={};
+  for(const [id,audio] of Object.entries(state.feelAudio||{}))
+    feelAudio[id]=await saveMedia(audio,`sentimentos/${id}/audio`,mediaPaths);
+  const configs={
+    rotina:{routine},
+    espera:{waitMin:state.waitMin,waitPick:state.waitPick},
+    sentimentos:{feelAudio},
+    escala:{helps:state.helps,scalePick:state.scalePick}
+  };
+  if(state.user.child!==cloudChild.nome||state.user.gender!==cloudChild.genero){
+    failOnError(await sb.from('criancas').update({nome:state.user.child,genero:state.user.gender}).eq('id',cloudChild.id).select('id').single());
+    cloudChild={...cloudChild,nome:state.user.child,genero:state.user.gender};
+  }
+  for(const [type,config] of Object.entries(configs)){
+    const board=cloudBoards[type];
+    if(!board)throw new Error('O quadro "'+type+'" não existe na conta.');
+    failOnError(await sb.from('quadros').update({config}).eq('id',board.id).eq('user_id',cloudUser.id).select('id').single());
+  }
+  const obsolete=[...storedMediaPaths].filter(path=>!mediaPaths.has(path));
+  if(obsolete.length)failOnError(await sb.storage.from('midia').remove(obsolete));
+  for(const [slot,path] of mediaSlots)if(obsolete.includes(path)){mediaSlots.delete(slot);mediaValues.delete(slot)}
+  storedMediaPaths=mediaPaths;
+}
+async function loadCloudState(user){
+  cloudReady=false;cloudUser=user;cloudChild=null;cloudBoards={};mediaSlots=new Map();mediaValues=new Map();storedMediaPaths=new Set();
+  const profile=failOnError(await sb.from('profiles').select('id,nome,email,role,trial_ends_at').eq('id',user.id).single());
+  cloudProfile=profile;
+  let child=failOnError(await sb.from('criancas').select('id,nome,genero').eq('user_id',user.id).order('created_at').limit(1).maybeSingle());
+  if(!child){
+    if(new Date(profile.trial_ends_at).getTime()<=Date.now())throw new Error('Não há perfil de criança nesta conta e o período de teste terminou. Fale com o suporte para liberar a configuração inicial.');
+    const childName=user.user_metadata?.nome_crianca||'Criança';
+    child=failOnError(await sb.from('criancas').insert({user_id:user.id,nome:childName,genero:user.user_metadata?.genero_crianca==='f'?'f':'m'}).select('id,nome,genero').single());
+  }
+  cloudChild=child;
+  const rows=failOnError(await sb.from('quadros').select('id,tipo,nome,config').eq('user_id',user.id));
+  for(const row of rows)cloudBoards[row.tipo]=row;
+  const base=fresh({name:profile.nome||user.user_metadata?.nome||'Responsável',email:profile.email||user.email||'',child:child.nome,gender:child.genero});
+  const initial={
+    rotina:{routine:base.routine},
+    espera:{waitMin:base.waitMin,waitPick:base.waitPick},
+    sentimentos:{feelAudio:{}},
+    escala:{helps:base.helps,scalePick:base.scalePick}
+  };
+  const names={rotina:'Rotina',espera:'Espera',sentimentos:'Sentimentos',escala:'Escala'};
+  const missing=Object.keys(initial).filter(type=>!cloudBoards[type]);
+  if(missing.length){
+    const inserted=failOnError(await sb.from('quadros').insert(missing.map(tipo=>({user_id:user.id,crianca_id:child.id,tipo,nome:names[tipo],config:initial[tipo]}))).select('id,tipo,nome,config'));
+    for(const row of inserted)cloudBoards[row.tipo]=row;
+  }
+  const subscriptions=failOnError(await sb.from('assinaturas').select('plano,status,created_at,periodo_fim').eq('user_id',user.id).eq('status','ativa').order('created_at',{ascending:false}).limit(1));
+  const subscription=subscriptions[0];
+  const active=subscription&&(!subscription.periodo_fim||new Date(subscription.periodo_fim).getTime()>Date.now())?subscription:null;
+  const configs=Object.fromEntries(Object.entries(cloudBoards).map(([type,row])=>[type,row.config||{}]));
+  S={...base,
+    routine:Array.isArray(configs.rotina.routine)?configs.rotina.routine:base.routine,
+    waitMin:Number(configs.espera.waitMin)||base.waitMin,
+    waitPick:configs.espera.waitPick??null,
+    feelAudio:configs.sentimentos.feelAudio||{},
+    helps:Array.isArray(configs.escala.helps)?configs.escala.helps:base.helps,
+    scalePick:Number(configs.escala.scalePick)||base.scalePick,
+    plan:active?.plano||null,planAt:active?.created_at?new Date(active.created_at).getTime():null
+  };
+  for(const item of S.routine){
+    item.photo=await loadMedia(item.photo,`rotina/${item.id}/foto`);
+    item.audio=await loadMedia(item.audio,`rotina/${item.id}/audio`);
+  }
+  for(const [id,audio] of Object.entries(S.feelAudio))
+    S.feelAudio[id]=await loadMedia(audio,`sentimentos/${id}/audio`);
+  cloudReady=true;
+  if(missing.length||!Array.isArray(configs.rotina.routine))await persistCloud(JSON.parse(JSON.stringify(S)));
+}
+function showStartupError(error){
+  const root=document.getElementById('root');
+  root.innerHTML=`<div class="card stack" style="max-width:620px;margin:12vh auto"><h1>Não foi possível conectar</h1><p class="muted">${esc(error.message||error)}</p><button class="btn primary" data-act="retry-load">Tentar novamente</button></div>`;
+}
+async function boot(){
+  if(!sb){showStartupError(new Error('A configuração do Supabase não foi carregada. Atualize a página ou avise o suporte.'));return}
+  try{
+    const {data,error}=await sb.auth.getSession();
+    if(error)throw error;
+    if(data.session)await loadCloudState(data.session.user);
+    render();
+  }catch(error){showStartupError(error)}
+}
+if(sb)sb.auth.onAuthStateChange(event=>{
+  if(event==='SIGNED_OUT'){S=null;cloudReady=false;cloudUser=null;cloudProfile=null;cloudChild=null;cloudBoards={};view='home';render()}
+});
+let S=null;
+let view='home', kid=false, editing=false, modal=null, toastMsg='', toastT=0;
 
 const gi=()=>S&&S.user.gender==='f'?1:0;
-const daysLeft=()=>Math.max(0,TRIAL-Math.floor((Date.now()-S.createdAt)/DAY));
-const hasAccess=()=>!!S.plan||daysLeft()>0;
+const daysLeft=()=>Math.max(0,Math.ceil((new Date(cloudProfile.trial_ends_at).getTime()-Date.now())/DAY));
+const hasAccess=()=>!!S.plan||new Date(cloudProfile.trial_ends_at).getTime()>Date.now();
 function feelPhrase(f){const w=f.t[gi()];if(f.p===true)return w;if(f.p)return f.p;return 'Estou '+w.charAt(0).toLowerCase()+w.slice(1)}
 
 /* voz */
@@ -86,6 +212,7 @@ function viewWelcome(){
     </div>
     <div class="feat"><span>🗓️ Rotina</span><span>⏳ Espera</span><span>💬 Sentimentos</span><span>🌡️ Escala da emoção</span><span>🎙️ Sua voz</span><span>📷 Suas fotos</span></div>
   </div>
+  <div class="auth-panel">
   <form class="card stack signup" id="signup" novalidate>
     <div><h2>Comece seus 7 dias grátis</h2><p class="muted small">Sem cartão agora. Depois, R$ 14,90 por mês ou R$ 119,90 por ano.</p></div>
     <label class="field">Seu nome<input class="input" id="su-name" autocomplete="given-name" required placeholder="Ex.: Ana"></label>
@@ -97,8 +224,18 @@ function viewWelcome(){
     <label class="row small" style="align-items:flex-start;gap:10px;flex-wrap:nowrap"><input type="checkbox" id="su-terms" style="width:22px;height:22px;flex:none;margin-top:2px"><span>Li e aceito os <button type="button" class="linkish" data-legal="1" style="border:0;background:none;padding:0;color:var(--accent);font-weight:700;text-decoration:underline">termos de uso e a política de privacidade</button>.</span></label>
     <p class="small" id="su-err" style="color:var(--s5);font-weight:700" hidden></p>
     <button class="btn primary big block" type="submit">Criar conta e começar</button>
-    <p class="muted small">Protótipo: os dados ficam só neste navegador. Nenhuma senha é guardada.</p>
-  </form></div>`;
+    <p class="muted small">Seus dados e sua senha ficam protegidos pelo Supabase.</p>
+    <button class="btn ghost block" type="button" id="show-login">Já tenho uma conta — entrar</button>
+  </form>
+  <form class="card stack signup" id="login" novalidate hidden>
+    <div><h2>Entrar na sua conta</h2><p class="muted small">Acesse sua rotina de qualquer dispositivo.</p></div>
+    <label class="field">E-mail<input class="input" id="li-email" type="email" autocomplete="email" required placeholder="voce@email.com"></label>
+    <label class="field">Senha<input class="input" id="li-pass" type="password" autocomplete="current-password" required></label>
+    <p class="small" id="li-err" style="color:var(--s5);font-weight:700" hidden></p>
+    <button class="btn primary big block" type="submit">Entrar</button>
+    <button class="btn ghost block" type="button" id="show-signup">Criar uma conta</button>
+  </form>
+  </div></div>`;
 }
 
 function viewHome(){
@@ -116,7 +253,7 @@ function viewHome(){
 function trialBanner(){
   if(S.plan)return '';const d=daysLeft();
   if(d>2)return '';
-  return `<div class="banner"><div><strong>${d===0?'Seu teste grátis terminou.':d===1?'Hoje é o último dia do teste grátis.':'Faltam 2 dias do teste grátis.'}</strong><p class="small">Assine para continuar usando os quadros de ${esc(S.user.child)}.</p></div><button class="btn primary" data-go="planos">Ver planos</button></div>`;
+  return `<div class="banner"><div><strong>${d===0?'Seu teste grátis terminou.':d===1?'Hoje é o último dia do teste grátis.':'Faltam 2 dias do teste grátis.'}</strong><p class="small">Veja as opções disponíveis para continuar usando os quadros de ${esc(S.user.child)}.</p></div><button class="btn primary" data-go="planos">Ver planos</button></div>`;
 }
 
 function kidBar(title){
@@ -188,27 +325,21 @@ function viewEscala(){
 
 function viewPlanos(){
   const d=daysLeft();
-  return `<div class="stack" style="gap:20px"><div><h1>Planos</h1><p class="muted">${S.plan?'Você já é assinante. Obrigada por apoiar o Rotina Atípica.':d>0?`Você ainda tem ${d} ${d===1?'dia':'dias'} de teste grátis. Nada é cobrado até você escolher um plano.`:'Seu teste grátis terminou. Escolha um plano para continuar com os quadros e tudo o que você já montou.'}</p></div>
+  return `<div class="stack" style="gap:20px"><div><h1>Planos</h1><p class="muted">${S.plan?'Você já é assinante. Obrigada por apoiar o Rotina Atípica.':d>0?`Você ainda tem ${d} ${d===1?'dia':'dias'} de teste grátis.`:'Seu teste grátis terminou; seus dados continuam guardados.'}</p></div>
   <div class="plans">
    <div class="card plan stack"><div><p class="eyebrow">Mensal</p><p class="price">R$ 14,90<span class="muted small" style="font-family:var(--f-body)"> /mês</span></p></div>
      <ul class="ticks"><li>Todos os quadros</li><li>Fotos e voz própria nos cartões</li><li>Celular, tablet e computador</li><li>Cancele quando quiser</li></ul>
-     <button class="btn block big" data-buy="mensal" ${S.plan==='mensal'?'disabled':''}>${S.plan==='mensal'?'Plano atual':'Assinar mensal'}</button></div>
+     <button class="btn block big" disabled>${S.plan==='mensal'?'Plano atual':'Pagamento em configuração'}</button></div>
    <div class="card plan best stack"><div class="row" style="justify-content:space-between"><p class="eyebrow">Anual</p><span class="chip ok">Economize 33%</span></div><div><p class="price">R$ 119,90<span class="muted small" style="font-family:var(--f-body)"> /ano</span></p><p class="muted small">Equivale a R$ 9,99 por mês</p></div>
      <ul class="ticks"><li>Tudo do plano mensal</li><li>R$ 58,90 a menos no ano</li><li>Uma cobrança por ano</li></ul>
-     <button class="btn primary block big" data-buy="anual" ${S.plan==='anual'?'disabled':''}>${S.plan==='anual'?'Plano atual':'Assinar anual'}</button></div>
+     <button class="btn primary block big" disabled>${S.plan==='anual'?'Plano atual':'Pagamento em configuração'}</button></div>
   </div>
-  <p class="muted small">Pagamento por Mercado Pago (cartão, com renovação automática). Dúvidas: WhatsApp ${WA_SHOW}.</p></div>`;
-}
-function viewCheckout(){
-  const p=checkoutPlan==='anual'?{n:'Anual',v:'R$ 119,90 por ano'}:{n:'Mensal',v:'R$ 14,90 por mês'};
-  return `<div class="card stack" style="max-width:560px"><p class="eyebrow">Mercado Pago</p><h2>Assinatura ${p.n}</h2><p class="price" style="font-size:1.8rem">${p.v}</p>
-   <p class="muted">Na plataforma publicada, este botão abre o checkout do Mercado Pago. Quando o pagamento é aprovado, o Mercado Pago avisa o nosso servidor e o acesso é liberado sozinho.</p>
-   <button class="btn ok big block" data-act="pay-ok">Simular pagamento aprovado</button><button class="btn ghost block" data-go="planos">Voltar</button></div>`;
+  <p class="muted small">A integração de pagamentos ainda não está ativa. Nenhuma cobrança pode ser feita por esta tela. Dúvidas: <a href="${WA_URL}" target="_blank" rel="noopener">WhatsApp ${WA_SHOW}</a>.</p></div>`;
 }
 function viewPaywall(){
   return `<div class="card stack" style="max-width:620px;margin:20px auto;text-align:center;align-items:center"><div style="font-size:4rem">🔒</div><h1>O teste grátis terminou</h1>
-  <p class="muted">A rotina de ${esc(S.user.child)} continua guardada. Assine para voltar a usar os quadros.</p>
-  <div class="row" style="justify-content:center"><button class="btn primary big" data-go="planos">Ver planos</button><a class="btn" href="${WA_URL}" target="_blank" rel="noopener">💬 Falar com a gente</a></div></div>`;
+  <p class="muted">A rotina de ${esc(S.user.child)} continua guardada. Os pagamentos ainda estão sendo configurados; fale com o suporte para saber quando o acesso poderá ser retomado.</p>
+  <div class="row" style="justify-content:center"><a class="btn" href="${WA_URL}" target="_blank" rel="noopener">💬 Falar com a gente</a></div></div>`;
 }
 
 function viewAjuda(){
@@ -218,7 +349,7 @@ function viewAjuda(){
   <div class="card stack"><h3>Perguntas comuns</h3>
    <p><strong>Como gravo minha voz num cartão?</strong><br><span class="muted">Na Rotina, toque em “Editar rotina”, depois no lápis do passo e em “Gravar agora”. No celular, “Escolher áudio” também abre o gravador.</span></p>
    <p><strong>A criança pode mexer sem bagunçar?</strong><br><span class="muted">Sim. Use “Mostrar para a criança”: os botões de edição somem e, para sair, é preciso segurar o cadeado.</span></p>
-   <p><strong>O que acontece depois dos 7 dias?</strong><br><span class="muted">Você escolhe o plano mensal ou anual. Se não assinar, seus quadros ficam guardados, só ficam bloqueados.</span></p></div></div>`;
+   <p><strong>O que acontece depois dos 7 dias?</strong><br><span class="muted">Seus quadros continuam guardados. A cobrança ainda está sendo configurada; fale com o suporte para saber sobre a retomada do acesso.</span></p></div></div>`;
 }
 
 function viewPrivacidade(){
@@ -227,9 +358,9 @@ function viewPrivacidade(){
   <h3>Que dados coletamos</h3><p>Da responsável: nome, e-mail e senha (guardada de forma criptografada). Da criança: apenas o nome ou apelido e, se você quiser, fotos e gravações de voz colocadas nos cartões. Não pedimos data de nascimento, diagnóstico, escola ou documentos.</p>
   <h3>Para que usamos</h3><p>Somente para fazer os quadros funcionarem e para controlar a assinatura. Não vendemos nem compartilhamos dados para publicidade.</p>
   <h3>Dados de crianças (LGPD, art. 14)</h3><p>Os dados da criança são tratados no melhor interesse dela e com o consentimento da mãe, pai ou responsável legal, dado no cadastro. Fotos e áudios ficam visíveis só para a sua conta.</p>
-  <h3>Pagamentos</h3><p>Os dados do cartão são digitados no Mercado Pago. O Rotina Atípica não recebe nem guarda o número do cartão.</p>
+  <h3>Pagamentos</h3><p>A integração de pagamentos ainda não está ativa. Quando estiver disponível, os dados do cartão serão tratados pelo Mercado Pago; o Rotina Atípica não receberá nem guardará o número do cartão.</p>
   <h3>Seus direitos</h3><p>Você pode ver, corrigir, baixar ou apagar seus dados e os da criança a qualquer momento, em “Minha conta” ou pelo WhatsApp ${WA_SHOW}.</p>
-  <h3>Termos de uso</h3><p>O Rotina Atípica é uma ferramenta de apoio à organização da rotina e não substitui acompanhamento terapêutico ou médico. O teste grátis dura 7 dias a partir do cadastro. As assinaturas renovam automaticamente e podem ser canceladas a qualquer momento, valendo até o fim do período pago.</p>
+  <h3>Termos de uso</h3><p>O Rotina Atípica é uma ferramenta de apoio à organização da rotina e não substitui acompanhamento terapêutico ou médico. O teste grátis dura 7 dias a partir do cadastro. As opções de assinatura e cobrança ainda estão em configuração.</p>
   <h3>Pictogramas</h3><p>Nesta demonstração os cartões usam emojis. A versão final pode usar pictogramas ARASAAC, com o crédito exigido: “Autor dos pictogramas: Sergio Palao. Origem: ARASAAC (arasaac.org). Licença: CC BY-NC-SA. Propriedade: Governo de Aragão (Espanha)”.</p>
   </div></div>`;
 }
@@ -237,28 +368,21 @@ function viewPrivacidade(){
 function viewConta(){
   return `<div class="stack" style="max-width:640px"><h1>Minha conta</h1>
   <div class="card stack"><label class="field">Seu nome<input class="input" id="ac-name" value="${esc(S.user.name)}"></label>
-   <label class="field">E-mail<input class="input" id="ac-email" type="email" value="${esc(S.user.email)}"></label>
-   <label class="field">Nome da criança<input class="input" id="ac-child" value="${esc(S.user.child)}"></label>
-   <div class="seg" role="group" aria-label="Gênero da criança"><button type="button" id="ac-m" data-g2="m" aria-pressed="${!gi()}">Menino</button><button type="button" id="ac-f" data-g2="f" aria-pressed="${!!gi()}">Menina</button></div>
+   <label class="field">E-mail<input class="input" id="ac-email" type="email" value="${esc(S.user.email)}" readonly></label>
+   <label class="field">Nome da criança<input class="input" id="ac-child" value="${esc(S.user.child)}" ${hasAccess()?'':'readonly'}></label>
+   <div class="seg" role="group" aria-label="Gênero da criança"><button type="button" id="ac-m" data-g2="m" aria-pressed="${!gi()}" ${hasAccess()?'':'disabled'}>Menino</button><button type="button" id="ac-f" data-g2="f" aria-pressed="${!!gi()}" ${hasAccess()?'':'disabled'}>Menina</button></div>
    <button class="btn primary" data-act="save-acct">Salvar</button></div>
   <div class="card stack"><h3>Assinatura</h3><p>${S.plan?`Plano ${S.plan}, desde ${new Date(S.planAt).toLocaleDateString('pt-BR')}.`:daysLeft()>0?`Teste grátis: ${daysLeft()} ${daysLeft()===1?'dia restante':'dias restantes'}.`:'Teste grátis encerrado.'}</p>
-   <div class="row">${S.plan?'<button class="btn danger" data-act="cancel-plan">Cancelar assinatura</button>':'<button class="btn primary" data-go="planos">Ver planos</button>'}</div></div>
-  <div class="card stack"><h3>Testar a demonstração</h3><p class="muted small">Botões só deste protótipo, para ver o teste grátis acabando.</p>
-   <div class="row"><button class="btn" data-act="skip-day">Avançar 1 dia</button><button class="btn" data-act="end-trial">Encerrar teste agora</button><button class="btn" data-act="restart-trial">Voltar ao dia 1</button></div></div>
+   ${S.plan?'<p class="muted small">Para alterar ou cancelar o plano, fale com o suporte.</p>':'<button class="btn primary" data-go="planos">Ver planos</button>'}</div>
   <div class="card stack"><h3>Mais</h3><div class="row"><button class="btn" data-go="ajuda">Ajuda</button><button class="btn" data-go="privacidade">Privacidade e termos</button><button class="btn" data-go="admin">Painel admin</button></div></div>
-  <div class="card stack"><h3>Apagar meus dados</h3><p class="muted small">Remove a conta, a rotina, as fotos e as gravações deste navegador.</p>
-   ${confirmWipe?'<div class="row"><button class="btn danger" data-act="wipe">Sim, apagar tudo</button><button class="btn" data-act="nowipe">Não apagar</button></div>':'<div class="row"><button class="btn danger" data-act="ask-wipe">Apagar meus dados</button></div>'}</div></div>`;
+  <div class="card stack"><h3>Apagar meus dados</h3><p class="muted small">A exclusão automática da conta e dos arquivos ainda não está configurada. Peça a exclusão pelo canal de suporte para que seus dados sejam removidos corretamente.</p>
+   <a class="btn danger" href="${WA_URL}" target="_blank" rel="noopener">Solicitar exclusão pelo WhatsApp</a></div>
+  <div class="row"><button class="btn ghost" data-act="sign-out">Sair da conta</button></div></div>`;
 }
 
 function viewAdmin(){
-  if(!adminOk)return `<div class="card stack" style="max-width:520px"><p class="eyebrow">Área restrita</p><h2>Painel do administrador</h2><p class="muted">Na plataforma publicada, só a conta com papel “admin” no Supabase entra aqui. As regras de segurança do banco bloqueiam qualquer outra usuária.</p><button class="btn primary" data-act="admin-in">Entrar como admin (demonstração)</button></div>`;
-  const days=[3,5,2,6,4,8,7,5,9,6,11,8,10,12];
-  const max=Math.max(...days);
-  const users=[['Mariana S.','mariana@exemplo.com','04/10/2026','Anual','Ativa'],['Juliana R.','juliana@exemplo.com','09/10/2026','Mensal','Ativa'],['Patrícia L.','patricia@exemplo.com','12/10/2026','Teste','5 dias restantes'],['Camila T.','camila@exemplo.com','14/10/2026','Teste','3 dias restantes'],['Renata F.','renata@exemplo.com','28/09/2026','Mensal','Cancelada'],['Aline M.','aline@exemplo.com','17/10/2026','Teste','6 dias restantes']];
-  return `<div class="stack" style="gap:18px"><div class="row" style="justify-content:space-between"><div><h1>Painel admin</h1><p class="muted small">Dados de exemplo. Na versão publicada, os números vêm do Supabase.</p></div><span class="chip warn">Exemplo</span></div>
-  <div class="kpis">${[['Usuárias','212'],['Em teste grátis','47'],['Plano mensal','118'],['Plano anual','39'],['Cancelamentos no mês','8'],['Novas hoje','12'],['Novas no mês','96'],['Faturamento do mês','R$ 2.430,47']].map(([k,v])=>`<div class="card kpi"><p class="eyebrow">${k}</p><p class="v">${v}</p></div>`).join('')}</div>
-  <div class="card stack"><h3>Novas usuárias por dia</h3><div class="bars" aria-label="Últimos 14 dias">${days.map(d=>`<div style="height:${d/max*100}%"><span>${d}</span></div>`).join('')}</div><div class="barlabels">${days.map((d,i)=>`<span>${5+i}</span>`).join('')}</div><p class="muted small">Dias 5 a 18 de outubro</p></div>
-  <div class="tablewrap"><table><thead><tr><th>Nome</th><th>E-mail</th><th>Cadastro</th><th>Plano</th><th>Status</th></tr></thead><tbody>${users.map(u=>`<tr>${u.map((c,i)=>`<td>${i===4?`<span class="chip ${c==='Ativa'?'ok':c==='Cancelada'?'warn':''}">${c}</span>`:c}</td>`).join('')}</tr>`).join('')}</tbody></table></div></div>`;
+  if(cloudProfile.role!=='admin')return `<div class="card stack" style="max-width:520px"><p class="eyebrow">Área restrita</p><h2>Painel do administrador</h2><p class="muted">Esta conta não tem permissão de administradora.</p></div>`;
+  return `<div class="card stack" style="max-width:620px"><p class="eyebrow">Área administrativa</p><h1>Painel admin</h1><p class="muted">O banco está protegido e a função de resumo está pronta. Os indicadores do painel ainda não estão conectados à interface.</p></div>`;
 }
 
 /* ---------- modais ---------- */
@@ -292,7 +416,7 @@ function render(){
   document.documentElement.classList.toggle('kid',kid);
   if(!S){root.innerHTML=viewWelcome()+(modal&&modal.type==='legal'?legalModal():'');bindSignup();return}
   const locked=['rotina','espera','sentimentos','escala'].includes(view)&&!hasAccess();
-  const body=locked?viewPaywall():({home:viewHome,rotina:viewRotina,espera:viewEspera,sentimentos:viewSentimentos,escala:viewEscala,planos:viewPlanos,checkout:viewCheckout,ajuda:viewAjuda,privacidade:viewPrivacidade,conta:viewConta,admin:viewAdmin}[view]||viewHome)();
+  const body=locked?viewPaywall():({home:viewHome,rotina:viewRotina,espera:viewEspera,sentimentos:viewSentimentos,escala:viewEscala,planos:viewPlanos,ajuda:viewAjuda,privacidade:viewPrivacidade,conta:viewConta,admin:viewAdmin}[view]||viewHome)();
   const navBtn=([v,i,l],cls)=>`<button class="${cls}" data-go="${v}" ${view===v?'aria-current="page"':''}><span class="i" aria-hidden="true">${i}</span>${l}</button>`;
   root.innerHTML=`<div class="shell">
    <nav class="side" aria-label="Menu"><button class="brand" data-go="home">${LOGO}Rotina Atípica</button>
@@ -307,15 +431,43 @@ function legalModal(){return `<div class="overlay" data-close="1"><div class="sh
 
 let suGender='m';
 function bindSignup(){
-  const f=document.getElementById('signup');if(!f)return;
-  f.addEventListener('submit',e=>{e.preventDefault();
+  const signup=document.getElementById('signup'),login=document.getElementById('login');if(!signup||!login)return;
+  const show=(isLogin)=>{
+    signup.hidden=isLogin;login.hidden=!isLogin;
+    (isLogin?document.getElementById('li-email'):document.getElementById('su-name')).focus();
+  };
+  document.getElementById('show-login').addEventListener('click',()=>show(true));
+  document.getElementById('show-signup').addEventListener('click',()=>show(false));
+  signup.addEventListener('submit',async e=>{e.preventDefault();
     const v=id=>document.getElementById(id).value.trim(), err=document.getElementById('su-err');
     let m='';
     if(!v('su-name'))m='Escreva seu nome.';else if(!/^\S+@\S+\.\S+$/.test(v('su-email')))m='Confira o e-mail. Ele precisa ter @ e um domínio, como voce@email.com.';
     else if(v('su-pass').length<6)m='A senha precisa ter pelo menos 6 caracteres.';else if(!v('su-child'))m='Escreva o nome ou apelido da criança.';
     else if(!document.getElementById('su-terms').checked)m='Para continuar, aceite os termos e a política de privacidade.';
     if(m){err.textContent=m;err.hidden=false;return}
-    S=fresh({name:v('su-name'),email:v('su-email'),child:v('su-child'),gender:suGender});save();view='home';render();toast('Conta criada. Seus 7 dias grátis começaram hoje.');
+    const button=signup.querySelector('[type=submit]');button.disabled=true;err.hidden=true;
+    try{
+      const {data,error}=await sb.auth.signUp({email:v('su-email'),password:v('su-pass'),options:{emailRedirectTo:'https://herculesfreire300.github.io/Rotina-Atipica/',data:{nome:v('su-name'),nome_crianca:v('su-child'),genero_crianca:suGender}}});
+      if(error)throw error;
+      if(data.session){await loadCloudState(data.session.user);view='home';render();toast('Conta criada. Seus 7 dias grátis começaram hoje.')}
+      else{
+        document.getElementById('li-email').value=v('su-email');
+        show(true);
+        const status=document.getElementById('li-err');status.style.color='var(--accent)';status.textContent='Conta criada. Confirme o endereço pelo link enviado ao seu e-mail e depois entre aqui.';status.hidden=false;
+      }
+    }catch(error){err.textContent=error.message||'Não foi possível criar a conta.';err.hidden=false}
+    finally{button.disabled=false}
+  });
+  login.addEventListener('submit',async e=>{
+    e.preventDefault();
+    const button=login.querySelector('[type=submit]'),err=document.getElementById('li-err');
+    button.disabled=true;err.style.color='var(--s5)';err.hidden=true;
+    try{
+      const {data,error}=await sb.auth.signInWithPassword({email:document.getElementById('li-email').value.trim(),password:document.getElementById('li-pass').value});
+      if(error)throw error;
+      await loadCloudState(data.user);view='home';render();toast('Bem-vinda de volta.');
+    }catch(error){err.textContent=error.message||'Não foi possível entrar.';err.hidden=false}
+    finally{button.disabled=false}
   });
 }
 function bindHold(){
@@ -337,9 +489,10 @@ document.addEventListener('click',e=>{
   if(d.close){modal=null;render();return}
   if(d.legal){modal={type:'legal'};render();return}
   if(d.gender){suGender=d.gender;document.querySelectorAll('[data-gender]').forEach(b=>b.setAttribute('aria-pressed',b.dataset.gender===suGender));return}
+  if(d.act==='retry-load'){boot();return}
   if(!S)return;
   if(d.g2){S.user.gender=d.g2;save();render();return}
-  if(d.go){view=d.go;editing=false;confirmWipe=false;modal=null;render();window.scrollTo(0,0);return}
+  if(d.go){view=d.go;editing=false;modal=null;render();window.scrollTo(0,0);return}
   if(d.say){const r=S.routine.find(x=>x.id===d.say);if(r)speak(r.t,r.audio);return}
   if(d.done){const r=S.routine.find(x=>x.id===d.done);r.done=true;save();const nx=S.routine.find(x=>!x.done);speak(nx?'Muito bem! Agora: '+nx.t:'Muito bem! Acabou a rotina.');render();return}
   if(d.toggle){const r=S.routine.find(x=>x.id===d.toggle);r.done=!r.done;save();render();return}
@@ -350,7 +503,6 @@ document.addEventListener('click',e=>{
   if(d.wopt){S.waitPick=+d.wopt;save();tts('Enquanto espero, eu posso: '+WAITOPTS[+d.wopt][0]);render();return}
   if(d.feel){modal={type:'feel',id:d.feel};const f=FEEL.find(x=>x.id===d.feel);render();speak(feelPhrase(f),S.feelAudio[f.id]);return}
   if(d.lvl){S.scalePick=+d.lvl;save();render();return}
-  if(d.buy){checkoutPlan=d.buy;view='checkout';render();return}
   const a=d.act;if(!a)return;
   ({
    'kid':()=>{kid=true;editing=false;render();window.scrollTo(0,0)},
@@ -374,15 +526,8 @@ document.addEventListener('click',e=>{
    'say-lvl':()=>{const L=SCALE[S.scalePick-1];tts('Nível '+L.n+'. '+L.t[gi()]+'. O que me ajuda: '+S.helps[L.n-1].join(', '))},
    'edit-helps':()=>{modal={type:'helps'};render()},
    'save-helps':()=>{S.helps[S.scalePick-1]=document.getElementById('hp-text').value.split('\n').map(s=>s.trim()).filter(Boolean);save();modal=null;render();toast('Salvo.')},
-   'pay-ok':()=>{S.plan=checkoutPlan;S.planAt=Date.now();save();view='home';render();toast('Assinatura ativa. Obrigada!')},
-   'cancel-plan':()=>{S.plan=null;S.planAt=null;save();render();toast('Assinatura cancelada.')},
-   'skip-day':()=>{S.createdAt-=DAY;save();render();toast(daysLeft()>0?`Agora faltam ${daysLeft()} dias.`:'O teste grátis terminou.')},
-   'end-trial':()=>{S.createdAt=Date.now()-TRIAL*DAY;S.plan=null;save();render();toast('O teste grátis terminou.')},
-   'restart-trial':()=>{S.createdAt=Date.now();S.plan=null;save();render();toast('Teste grátis reiniciado: 7 dias.')},
-   'save-acct':()=>{const v=id=>document.getElementById(id).value.trim();S.user.name=v('ac-name')||S.user.name;S.user.email=v('ac-email')||S.user.email;S.user.child=v('ac-child')||S.user.child;save();render();toast('Dados salvos.')},
-   'ask-wipe':()=>{confirmWipe=true;render()},'nowipe':()=>{confirmWipe=false;render()},
-   'wipe':()=>{try{localStorage.removeItem(KEY)}catch(e){}mem=null;S=null;view='home';confirmWipe=false;render()},
-   'admin-in':()=>{adminOk=true;render()},
+   'save-acct':()=>{const v=id=>document.getElementById(id).value.trim();S.user.name=v('ac-name')||S.user.name;if(hasAccess())S.user.child=v('ac-child')||S.user.child;save();render();toast('Dados salvos.')},
+   'sign-out':async()=>{try{await saveQueue;const {error}=await sb.auth.signOut();if(error)throw error}catch(error){toast('Não foi possível sair: '+esc(error.message||error))}},
    'copy-wa':()=>{navigator.clipboard.writeText(WA_SHOW).then(()=>toast('Número copiado.')).catch(()=>toast('Selecione o número para copiar.'))},
   }[a]||(()=>{}))();
 });
@@ -393,5 +538,5 @@ document.addEventListener('change',e=>{
   if(t.id==='aud-feel'){readFile(f,u=>{S.feelAudio[modal.id]=u;save();render();toast('Áudio adicionado.')})}
 });
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&modal){modal=null;render()}});
-render();
+boot();
 })();

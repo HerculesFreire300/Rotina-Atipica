@@ -43,7 +43,7 @@ create table public.quadros (
   crianca_id uuid not null,
   tipo       text not null check (tipo in ('rotina','espera','sentimentos','escala')),
   nome       text not null,
-  config     jsonb not null default '{}'::jsonb,  -- ex.: minutos do timer, textos "o que ajuda" por nível
+  config     jsonb not null default '{}'::jsonb,  -- estado do quadro: rotina, timer, sentimentos e escala
   created_at timestamptz not null default now(),
   unique (id, user_id),
   foreign key (crianca_id, user_id) references public.criancas(id, user_id) on delete cascade
