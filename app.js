@@ -2,12 +2,36 @@
 const DAY=86400000;
 const WA_NUM='5565993085010', WA_SHOW='(65) 99308-5010', WA_MSG='Olá, preciso de ajuda com o Rotina Atípica';
 const WA_URL='https://wa.me/'+WA_NUM+'?text='+encodeURIComponent(WA_MSG);
+const APP_URL='https://herculesfreire300.github.io/Rotina-Atipica/';
 const cfg=window.ROTINA_SUPABASE_CONFIG;
-const sb=window.supabase&&cfg?window.supabase.createClient(cfg.url,cfg.publishableKey):null;
+const rememberSessionKey='rotina-atipica-manter-conectada';
+let rememberSession=localStorage.getItem(rememberSessionKey)!=='false';
+const authStorageKey=cfg?'sb-'+new URL(cfg.url).hostname.split('.')[0]+'-auth-token':'';
+const authStorage={
+  getItem:key=>(rememberSession?localStorage:sessionStorage).getItem(key),
+  setItem:(key,value)=>(rememberSession?localStorage:sessionStorage).setItem(key,value),
+  removeItem:key=>{localStorage.removeItem(key);sessionStorage.removeItem(key)}
+};
+const sb=window.supabase&&cfg?window.supabase.createClient(cfg.url,cfg.publishableKey,{auth:{storage:authStorage,persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}}):null;
 const paymentsEnabled=cfg?.paymentsEnabled===true;
+let installPrompt=null,appInstalled=window.matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;
+if('serviceWorker' in navigator&&(location.protocol==='https:'||location.hostname==='localhost')){
+  window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(error=>console.error('PWA service worker registration failed:',error)));
+}
+window.addEventListener('beforeinstallprompt',event=>{event.preventDefault();installPrompt=event});
+window.addEventListener('appinstalled',()=>{appInstalled=true;document.querySelectorAll('[data-install-card]').forEach(card=>card.hidden=true)});
 let cloudUser=null,cloudProfile=null,cloudChild=null,cloudBoards={},cloudReady=false,saveQueue=Promise.resolve();
 let mediaSlots=new Map(),mediaValues=new Map(),storedMediaPaths=new Set();
 let paymentBusy=false;
+function setRememberSession(remember){
+  const current=authStorageKey&&(localStorage.getItem(authStorageKey)||sessionStorage.getItem(authStorageKey));
+  rememberSession=remember;
+  localStorage.setItem(rememberSessionKey,String(remember));
+  if(current){
+    (remember?localStorage:sessionStorage).setItem(authStorageKey,current);
+    (remember?sessionStorage:localStorage).removeItem(authStorageKey);
+  }
+}
 function save(){
   if(!cloudReady||!S){toast('A conta ainda não está conectada. Tente novamente.');return}
   const snapshot=JSON.parse(JSON.stringify(S));
@@ -31,10 +55,20 @@ const SCALE=[
  {n:4,c:'--s4',e:'😣',t:['Muito nervoso','Muito nervosa'],h:['Ficar num lugar silencioso','Apertar a almofada','Adulto falando pouco e devagar']},
  {n:5,c:'--s5',e:'😫',t:['Explodindo','Explodindo'],h:['Ficar em segurança','Um adulto perto, em silêncio','Esperar passar, sem pressa']}];
 const WAITOPTS=[['Respirar','🌬️'],['Bichinho','🧸'],['Livro','📖'],['Desenhar','🖍️'],['Música','🎵'],['Contar até 10','🔢']];
+const PERIODS=[['manha','Manhã','🌅'],['tarde','Tarde','☀️'],['noite','Noite','🌙'],['outro','Sem período','🗓️']];
+const APPOINTMENT_TYPES=[['psicologo','Psicólogo(a)'],['to','Terapeuta ocupacional'],['fonoaudiologo','Fonoaudiólogo(a)'],['neuropediatra','Neuropediatra']];
+const ROUTINE_TEMPLATES=[
+  {id:'manha',title:'Começo do dia',description:'Uma sequência tranquila para iniciar a manhã.',steps:[['Acordar','🌅'],['Ir ao banheiro','🚽'],['Escovar os dentes','🪥'],['Vestir a roupa','👕'],['Café da manhã','🥣'],['Preparar para sair','🎒']]},
+  {id:'escola',title:'Preparar para a escola',description:'Passos para se organizar antes de sair.',steps:[['Ir ao banheiro','🚽'],['Escovar os dentes','🪥'],['Vestir o uniforme','👕'],['Tomar café da manhã','🥣'],['Arrumar a mochila','🎒'],['Ir para a escola','🏫']]},
+  {id:'tarde',title:'Depois da escola',description:'Uma rotina leve para a volta para casa.',steps:[['Chegar em casa','🏠'],['Guardar a mochila','🎒'],['Lavar as mãos','🧼'],['Almoçar ou fazer um lanche','🍎'],['Descansar','😌'],['Brincar','🧸']]},
+  {id:'noite',title:'Preparar para dormir',description:'Um encerramento previsível e acolhedor para o dia.',steps:[['Guardar os brinquedos','🧸'],['Tomar banho','🛁'],['Vestir o pijama','🌙'],['Escovar os dentes','🪥'],['Ler uma história','📖'],['Dormir','😴']]}
+];
+const localTimeZone=()=>Intl.DateTimeFormat().resolvedOptions().timeZone||'America/Sao_Paulo';
 
 function fresh(u){
   return {user:u,createdAt:Date.now(),plan:null,planAt:null,
-    routine:[['Acordar','🌅'],['Ir ao banheiro','🚽'],['Escovar os dentes','🪥'],['Café da manhã','🥣'],['Vestir a roupa','👕'],['Escola','🏫']].map(([t,e])=>({id:uid(),t,e,photo:null,audio:null,done:false})),
+    routine:[['Acordar','🌅','manha'],['Ir ao banheiro','🚽','manha'],['Escovar os dentes','🪥','manha'],['Café da manhã','🥣','manha'],['Vestir a roupa','👕','manha'],['Escola','🏫','manha']].map(([t,e,period])=>({id:uid(),t,e,period,photo:null,audio:null,done:false})),
+    reminders:{enabled:false,time:'20:00',timezone:localTimeZone()},
     waitMin:5,waitPick:null,feelAudio:{},helps:SCALE.map(s=>s.h.slice()),scalePick:3};
 }
 
@@ -121,15 +155,20 @@ async function loadCloudState(user){
   }
   const subscriptions=failOnError(await sb.from('assinaturas').select('plano,status,created_at,periodo_fim,cancelada_em').eq('user_id',user.id).order('created_at',{ascending:false}).limit(1));
   const subscription=subscriptions[0]||null;
+  const reminderRow=failOnError(await sb.from('reminder_settings').select('enabled,reminder_time,timezone').eq('user_id',user.id).maybeSingle());
+  const appointmentReminder=failOnError(await sb.from('appointment_reminder_settings').select('enabled').eq('user_id',user.id).maybeSingle());
+  const appointments=failOnError(await sb.from('appointments').select('id,professional_type,appointment_at').eq('user_id',user.id).order('appointment_at'));
   const active=subscription&&subscription.status==='ativa'&&subscription.periodo_fim&&new Date(subscription.periodo_fim).getTime()>Date.now()?subscription:null;
   const configs=Object.fromEntries(Object.entries(cloudBoards).map(([type,row])=>[type,row.config||{}]));
   S={...base,
-    routine:Array.isArray(configs.rotina.routine)?configs.rotina.routine:base.routine,
+    routine:Array.isArray(configs.rotina.routine)?configs.rotina.routine.map(item=>({...item,period:PERIODS.some(([id])=>id===item.period)?item.period:'outro'})):base.routine,
     waitMin:Number(configs.espera.waitMin)||base.waitMin,
     waitPick:configs.espera.waitPick??null,
     feelAudio:configs.sentimentos.feelAudio||{},
     helps:Array.isArray(configs.escala.helps)?configs.escala.helps:base.helps,
     scalePick:Number(configs.escala.scalePick)||base.scalePick,
+    reminders:{enabled:reminderRow?.enabled||false,time:reminderRow?.reminder_time?.slice(0,5)||base.reminders.time,timezone:reminderRow?.timezone||localTimeZone()},
+    appointmentRemindersEnabled:appointmentReminder?.enabled||false,appointments,
     plan:active?.plano||null,planAt:active?.created_at?new Date(active.created_at).getTime():null,subscription
   };
   for(const item of S.routine){
@@ -148,17 +187,30 @@ function showStartupError(error){
 async function boot(){
   if(!sb){showStartupError(new Error('A configuração do Supabase não foi carregada. Atualize a página ou avise o suporte.'));return}
   try{
+    recoveryMode=recoveryMode||location.hash.includes('type=recovery');
     const {data,error}=await sb.auth.getSession();
     if(error)throw error;
+    if(recoveryMode){render();return}
     if(data.session)await loadCloudState(data.session.user);
     render();
   }catch(error){showStartupError(error)}
 }
 if(sb)sb.auth.onAuthStateChange(event=>{
+  if(event==='PASSWORD_RECOVERY'){recoveryMode=true;render()}
   if(event==='SIGNED_OUT'){S=null;cloudReady=false;cloudUser=null;cloudProfile=null;cloudChild=null;cloudBoards={};view='home';render()}
 });
 let S=null;
 let view='home', kid=false, editing=false, modal=null, toastMsg='', toastT=0;
+let recoveryMode=location.hash.includes('type=recovery');
+let calendarMonth=new Date(new Date().getFullYear(),new Date().getMonth(),1),calendarDate=localDateKey(new Date());
+
+function localDateKey(date){
+  return [date.getFullYear(),String(date.getMonth()+1).padStart(2,'0'),String(date.getDate()).padStart(2,'0')].join('-');
+}
+function localDateTimeValue(value){
+  const date=new Date(value);
+  return `${localDateKey(date)}T${String(date.getHours()).padStart(2,'0')}:${String(date.getMinutes()).padStart(2,'0')}`;
+}
 
 const gi=()=>S&&S.user.gender==='f'?1:0;
 const daysLeft=()=>Math.max(0,Math.ceil((new Date(cloudProfile.trial_ends_at).getTime()-Date.now())/DAY));
@@ -189,6 +241,25 @@ function readFile(file,cb){if(!file)return;const r=new FileReader();r.onload=()=
 function readImage(file,cb){if(!file)return;const r=new FileReader();r.onload=()=>{const img=new Image();img.onload=()=>{const m=360,s=Math.min(1,m/Math.max(img.width,img.height)),c=document.createElement('canvas');c.width=img.width*s;c.height=img.height*s;c.getContext('2d').drawImage(img,0,0,c.width,c.height);cb(c.toDataURL('image/jpeg',.82))};img.src=r.result};r.readAsDataURL(file)}
 
 function toast(m){toastMsg=m;clearTimeout(toastT);toastT=setTimeout(()=>{toastMsg='';const el=document.querySelector('.toast');if(el)el.remove()},3200);const el=document.querySelector('.toast');if(el)el.textContent=m;else document.body.insertAdjacentHTML('beforeend','<div class="toast" role="status">'+esc(m)+'</div>')}
+async function installApp(){
+  if(appInstalled){toast('O Rotina Atípica já está instalado neste dispositivo.');return}
+  if(installPrompt){
+    let result;
+    try{
+      await installPrompt.prompt();
+      result=await installPrompt.userChoice;
+    }catch(error){
+      console.error('PWA install prompt failed:',error);
+      installPrompt=null;
+      modal={type:'install'};render();
+      return;
+    }
+    installPrompt=null;
+    if(result.outcome==='accepted'){appInstalled=true;document.querySelectorAll('[data-install-card]').forEach(card=>card.hidden=true)}
+    return;
+  }
+  modal={type:'install'};render();
+}
 async function refreshSubscription(){
   const rows=failOnError(await sb.from('assinaturas').select('plano,status,created_at,periodo_fim,cancelada_em').eq('user_id',cloudUser.id).order('created_at',{ascending:false}).limit(1));
   S.subscription=rows[0]||null;
@@ -222,6 +293,85 @@ async function cancelSubscription(){
   finally{paymentBusy=false;render()}
 }
 
+function decodeVapidKey(value){
+  const padded=value.replace(/-/g,'+').replace(/_/g,'/')+'='.repeat((4-value.length%4)%4);
+  return Uint8Array.from(atob(padded),char=>char.charCodeAt(0));
+}
+async function registerPushDevice(){
+  if(!window.isSecureContext)throw new Error('As notificações exigem uma conexão HTTPS segura.');
+  if(!('serviceWorker' in navigator)||!('PushManager' in window)||!('Notification' in window))throw new Error('Este navegador não oferece suporte a notificações push.');
+  if(!cfg?.vapidPublicKey)throw new Error('As notificações ainda estão sendo configuradas pela plataforma.');
+  const isIOS=/iPhone|iPad|iPod/i.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+  if(isIOS&&!appInstalled)throw new Error('No iPhone ou iPad, adicione o Rotina Atípica à Tela de Início e abra o app instalado antes de ativar os lembretes.');
+  let permission=Notification.permission;
+  if(permission==='default')permission=await Notification.requestPermission();
+  if(permission!=='granted')throw new Error('A permissão de notificações não foi concedida. Ative-a nas configurações do navegador.');
+  const registration=await navigator.serviceWorker.ready;
+  let subscription=await registration.pushManager.getSubscription();
+  if(!subscription)subscription=await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:decodeVapidKey(cfg.vapidPublicKey)});
+  const value=subscription.toJSON();
+  failOnError(await sb.from('push_subscriptions').upsert({user_id:cloudUser.id,endpoint:subscription.endpoint,subscription:value,updated_at:new Date().toISOString()},{onConflict:'user_id,endpoint'}).select('endpoint').single());
+}
+async function removeCurrentPushDevice(){
+  if(!('serviceWorker' in navigator)||!('PushManager' in window))return;
+  const registration=await navigator.serviceWorker.ready,subscription=await registration.pushManager.getSubscription();
+  if(!subscription)return;
+  failOnError(await sb.from('push_subscriptions').delete().eq('user_id',cloudUser.id).eq('endpoint',subscription.endpoint));
+  await subscription.unsubscribe();
+}
+async function saveReminders(enabled,time){
+  if(!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time))throw new Error('Escolha um horário válido para o lembrete.');
+  const timezone=localTimeZone();
+  new Intl.DateTimeFormat('pt-BR',{timeZone:timezone});
+  failOnError(await sb.from('reminder_settings').upsert({user_id:cloudUser.id,enabled,reminder_time:time,timezone,updated_at:new Date().toISOString()},{onConflict:'user_id'}).select('user_id').single());
+  S.reminders={enabled,time,timezone};
+}
+async function enableReminders(){
+  const button=document.getElementById('reminder-time'),time=button?.value||S.reminders.time;
+  try{await registerPushDevice();await saveReminders(true,time);render();toast('Lembrete diário ativado neste dispositivo.')}
+  catch(error){toast(error.message||'Não foi possível ativar os lembretes.')}
+}
+async function disableReminders(){
+  try{await saveReminders(false,S.reminders.time);render();toast('Lembretes desativados.')}
+  catch(error){toast(error.message||'Não foi possível desativar os lembretes.')}
+}
+async function saveAppointmentReminders(enabled){
+  try{
+    if(enabled)await registerPushDevice();
+    failOnError(await sb.from('appointment_reminder_settings').upsert({user_id:cloudUser.id,enabled,updated_at:new Date().toISOString()},{onConflict:'user_id'}).select('user_id').single());
+    S.appointmentRemindersEnabled=enabled;render();
+    toast(enabled?'Lembretes de consultas ativados.':'Lembretes de consultas desativados.');
+  }catch(error){toast(error.message||'Não foi possível atualizar os lembretes de consultas.')}
+}
+async function saveAppointment(){
+  const id=modal.item?.id,type=document.getElementById('appointment-type').value,dateTime=document.getElementById('appointment-datetime').value;
+  const appointmentAt=new Date(dateTime);
+  if(!APPOINTMENT_TYPES.some(([value])=>value===type)||!dateTime||Number.isNaN(appointmentAt.getTime())){
+    toast('Informe um profissional, dia e horário válidos.');return;
+  }
+  const button=document.getElementById('save-appointment');button.disabled=true;
+  try{
+    const record={user_id:cloudUser.id,professional_type:type,appointment_at:appointmentAt.toISOString()};
+    const query=id?sb.from('appointments').update(record).eq('user_id',cloudUser.id).eq('id',id):sb.from('appointments').insert(record);
+    const saved=failOnError(await query.select('id,professional_type,appointment_at').single());
+    const index=S.appointments.findIndex(item=>item.id===saved.id);
+    if(index<0)S.appointments.push(saved);else S.appointments[index]=saved;
+    S.appointments.sort((a,b)=>a.appointment_at.localeCompare(b.appointment_at));
+    calendarDate=localDateKey(appointmentAt);calendarMonth=new Date(appointmentAt.getFullYear(),appointmentAt.getMonth(),1);
+    modal=null;render();toast(id?'Atendimento atualizado.':'Atendimento agendado.');
+  }catch(error){button.disabled=false;toast('Não foi possível salvar o atendimento: '+(error.message||error))}
+}
+async function deleteAppointment(id){
+  const appointment=S.appointments.find(item=>item.id===id);
+  if(!appointment)return;
+  const type=APPOINTMENT_TYPES.find(([value])=>value===appointment.professional_type)?.[1]||'atendimento';
+  if(!window.confirm(`Excluir o agendamento de ${type} em ${new Date(appointment.appointment_at).toLocaleString('pt-BR')}?`))return;
+  try{
+    failOnError(await sb.from('appointments').delete().eq('user_id',cloudUser.id).eq('id',id).select('id').single());
+    S.appointments=S.appointments.filter(item=>item.id!==id);render();toast('Atendimento excluído.');
+  }catch(error){toast('Não foi possível excluir o atendimento: '+(error.message||error))}
+}
+
 const pic=(x,cls='')=>'<div class="pic '+cls+'" aria-hidden="true">'+(x.photo?'<img alt="" src="'+x.photo+'">':esc(x.e))+'</div>';
 
 /* ---------- telas ---------- */
@@ -245,6 +395,7 @@ function viewWelcome(){
       <div class="arrow">→</div><div class="nl later"><div class="tag">Depois</div><div class="pic">🥣</div><div class="name">Café da manhã</div></div>
     </div>
     <div class="feat"><span>🗓️ Rotina</span><span>⏳ Espera</span><span>💬 Sentimentos</span><span>🌡️ Escala da emoção</span><span>🎙️ Sua voz</span><span>📷 Suas fotos</span></div>
+    ${installCard()}
   </div>
   <div class="auth-panel">
   <form class="card stack signup" id="signup" novalidate>
@@ -256,6 +407,7 @@ function viewWelcome(){
     <div class="field"><span>Para os textos dos cartões</span>
       <div class="seg" role="group" aria-label="Gênero da criança"><button type="button" id="su-m" data-gender="m" aria-pressed="true">Menino</button><button type="button" id="su-f" data-gender="f" aria-pressed="false">Menina</button></div></div>
     <label class="row small" style="align-items:flex-start;gap:10px;flex-wrap:nowrap"><input type="checkbox" id="su-terms" style="width:22px;height:22px;flex:none;margin-top:2px"><span>Li e aceito os <button type="button" class="linkish" data-legal="1" style="border:0;background:none;padding:0;color:var(--accent);font-weight:700;text-decoration:underline">termos de uso e a política de privacidade</button>.</span></label>
+    ${rememberSessionOption('su-remember')}
     <p class="small" id="su-err" style="color:var(--s5);font-weight:700" hidden></p>
     <button class="btn primary big block" type="submit">Criar conta e começar</button>
     <p class="muted small">Seus dados e sua senha ficam protegidos pelo Supabase.</p>
@@ -265,11 +417,32 @@ function viewWelcome(){
     <div><h2>Entrar na sua conta</h2><p class="muted small">Acesse sua rotina de qualquer dispositivo.</p></div>
     <label class="field">E-mail<input class="input" id="li-email" type="email" autocomplete="email" required placeholder="voce@email.com"></label>
     <label class="field">Senha<input class="input" id="li-pass" type="password" autocomplete="current-password" required></label>
+    ${rememberSessionOption('li-remember')}
     <p class="small" id="li-err" style="color:var(--s5);font-weight:700" hidden></p>
     <button class="btn primary big block" type="submit">Entrar</button>
+    <button class="btn ghost block" type="button" id="show-reset">Esqueci minha senha</button>
     <button class="btn ghost block" type="button" id="show-signup">Criar uma conta</button>
   </form>
+  <form class="card stack signup" id="password-reset" novalidate hidden>
+    <div><h2>Recuperar senha</h2><p class="muted small">Enviaremos um link para criar uma nova senha.</p></div>
+    <label class="field">E-mail da conta<input class="input" id="reset-email" type="email" autocomplete="email" required placeholder="voce@email.com"></label>
+    <p class="small" id="reset-err" hidden></p>
+    <button class="btn primary big block" type="submit">Enviar link de recuperação</button>
+    <button class="btn ghost block" type="button" id="back-login">Voltar para entrar</button>
+  </form>
   </div></div>`;
+}
+function viewPasswordRecovery(){
+  return `<div class="welcome" style="grid-template-columns:1fr;max-width:600px"><div class="card stack" style="max-width:520px;margin:10vh auto"><div class="row">${LOGO}<strong style="font-family:var(--f-display);font-size:1.3rem">Rotina Atípica</strong></div><h1>Escolha uma nova senha</h1><p class="muted">Crie uma senha com pelo menos 6 caracteres.</p><form class="stack" id="new-password-form"><label class="field">Nova senha<input class="input" id="new-password" type="password" autocomplete="new-password" minlength="6" required></label><label class="field">Confirme a nova senha<input class="input" id="confirm-password" type="password" autocomplete="new-password" minlength="6" required></label><p class="small" id="new-password-err" hidden></p><button class="btn primary big block" type="submit">Salvar nova senha</button></form></div></div>`;
+}
+
+function rememberSessionOption(id){
+  return `<label class="remember-option"><input type="checkbox" id="${id}" ${rememberSession?'checked':''}><span><strong>Manter conectado neste dispositivo</strong><span class="muted small">Não salvamos sua senha. Você pode sair da conta quando quiser.</span></span></label>`;
+}
+
+function installCard(){
+  if(appInstalled)return '';
+  return `<div class="install-card" data-install-card><img class="install-icon" src="app-icon-192.png" alt="" width="56" height="56"><div class="install-copy"><strong>Leve o Rotina Atípica para o celular</strong><span class="muted small">Adicione um ícone na tela inicial e abra como um aplicativo.</span></div><button class="btn primary install-cta" data-act="install-app">＋ Instalar app</button></div>`;
 }
 
 function viewHome(){
@@ -280,7 +453,55 @@ function viewHome(){
   <div class="stack" style="gap:18px">
   <div class="card nextup">${next?pic(next)+`<div style="flex:1;min-width:0"><p class="eyebrow">Agora na rotina de ${esc(S.user.child)}</p><h2>${esc(next.t)}</h2><p class="muted small">${doneN} de ${S.routine.length} passos feitos hoje</p></div><button class="btn primary" data-go="rotina">Abrir</button>`:`<div class="pic">🌟</div><div style="flex:1"><h2>Rotina de hoje concluída</h2><p class="muted small">${esc(S.user.child)} fez todos os ${S.routine.length} passos.</p></div>`}</div>
   <div class="tiles">${tiles.map(([v,e,t,d])=>`<button class="tile v-${v}" data-go="${v}"><span class="emo" aria-hidden="true">${e}</span><h3>${t}</h3><p>${d}</p></button>`).join('')}</div>
+  <button class="card photo-entry calendar-entry" data-go="calendario"><span class="photo-entry-icon" aria-hidden="true">🩺</span><span class="photo-entry-copy"><strong>Consultas e terapias</strong><span class="muted small">Agende e receba lembretes antes dos atendimentos</span></span><span class="photo-entry-arrow" aria-hidden="true">→</span></button>
+  <button class="card photo-entry" data-go="fotos"><span class="photo-entry-icon" aria-hidden="true">📷</span><span class="photo-entry-copy"><strong>Suas fotos</strong><span class="muted small">Adicione fotos da família aos cartões da rotina</span></span><span class="photo-entry-arrow" aria-hidden="true">→</span></button>
+  ${installCard()}
   <div class="card help"><div style="min-width:0;flex:1 1 240px"><h3>Precisa de ajuda?</h3><p class="muted small">Fale com a gente pelo WhatsApp ${WA_SHOW}.</p></div><a class="btn ok" href="${WA_URL}" target="_blank" rel="noopener">💬 Chamar no WhatsApp</a></div>
+  </div>`;
+}
+
+function viewCalendar(){
+  const year=calendarMonth.getFullYear(),month=calendarMonth.getMonth();
+  const firstDay=new Date(year,month,1),startOffset=firstDay.getDay();
+  const dayCount=new Date(year,month+1,0).getDate();
+  const cells=Array.from({length:Math.ceil((startOffset+dayCount)/7)*7},(_,index)=>{
+    const day=index-startOffset+1,date=new Date(year,month,day),key=localDateKey(date),inside=day>0&&day<=dayCount;
+    const count=inside?S.appointments.filter(item=>localDateKey(new Date(item.appointment_at))===key).length:0;
+    if(!inside)return '<span class="calendar-day empty" aria-hidden="true"></span>';
+    const countLabel=count?`, ${count} consulta(s)`:'';const marker=count?'<span class="calendar-dots" aria-hidden="true">'+'<i></i>'.repeat(Math.min(count,3))+'</span>':'';
+    return `<button class="calendar-day${calendarDate===key?' selected':''}${key===localDateKey(new Date())?' today':''}" data-calendar-date="${key}" aria-label="${date.toLocaleDateString('pt-BR')}${countLabel}" aria-pressed="${calendarDate===key}"><span>${day}</span>${marker}</button>`;
+  }).join('');
+  const appointments=S.appointments.filter(item=>localDateKey(new Date(item.appointment_at))===calendarDate).sort((a,b)=>a.appointment_at.localeCompare(b.appointment_at));
+  const selectedDate=new Date(`${calendarDate}T12:00:00`);
+  return `<div class="stack calendar-page">
+    <div class="pagehead"><div class="ttl"><span class="badge" aria-hidden="true">🩺</span><div><h1>Consultas e terapias</h1><p class="muted small">Seus compromissos, em um só lugar.</p></div></div><button class="btn primary" data-act="new-appointment">＋ Agendar atendimento</button></div>
+    <div class="card calendar-card">
+      <div class="calendar-heading"><button class="iconbtn" data-month-step="-1" aria-label="Mês anterior">‹</button><h2>${calendarMonth.toLocaleDateString('pt-BR',{month:'long',year:'numeric'})}</h2><button class="iconbtn" data-month-step="1" aria-label="Próximo mês">›</button></div>
+      <div class="calendar-grid calendar-weekdays" aria-hidden="true">${['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'].map(day=>`<span>${day}</span>`).join('')}</div>
+      <div class="calendar-grid">${cells}</div>
+    </div>
+    <div class="calendar-day-list"><div><h2>${selectedDate.toLocaleDateString('pt-BR',{weekday:'long',day:'numeric',month:'long'})}</h2><p class="muted small">${appointments.length?`${appointments.length} atendimento${appointments.length===1?'':'s'} agendado${appointments.length===1?'':'s'}`:'Nenhum atendimento neste dia.'}</p></div>
+      ${appointments.length?`<div class="stack">${appointments.map(item=>{const type=APPOINTMENT_TYPES.find(([id])=>id===item.professional_type);return `<article class="card appointment-card"><span class="appointment-time">${new Date(item.appointment_at).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}</span><div class="appointment-copy"><strong>${type?type[1]:'Atendimento'}</strong><span class="muted small">${new Date(item.appointment_at).toLocaleDateString('pt-BR',{day:'numeric',month:'long',year:'numeric'})}</span></div><button class="mini" data-appointment-edit="${item.id}" aria-label="Editar atendimento">✏️</button><button class="mini" data-appointment-delete="${item.id}" aria-label="Excluir atendimento">🗑️</button></article>`}).join('')}</div>`:`<div class="card calendar-empty"><span aria-hidden="true">📅</span><p>Se houver uma consulta neste dia, você pode adicioná-la ao calendário.</p><button class="btn" data-act="new-appointment">＋ Agendar neste dia</button></div>`}
+    </div>
+    <div class="card stack appointment-reminder-card"><div><h3>Lembretes de consultas</h3><p class="muted small">Receba avisos push 1 dia e 2 horas antes. A notificação não exibe o profissional nem dados da criança.</p></div>
+      <p class="small">${S.appointmentRemindersEnabled?'Lembretes de consultas ativados nesta conta; os avisos vão para os aparelhos cadastrados.':'Cadastre este aparelho e autorize as notificações para receber os lembretes.'}</p>
+      ${cfg?.vapidPublicKey?`<button class="btn ${S.appointmentRemindersEnabled?'':'primary'}" data-act="${S.appointmentRemindersEnabled?'disable-appointment-reminders':'enable-appointment-reminders'}">${S.appointmentRemindersEnabled?'Desativar lembretes de consultas':'Ativar neste aparelho'}</button>`:'<button class="btn" disabled>Notificações em preparação</button><p class="muted small">A ativação depende da configuração técnica das notificações push.</p>'}
+    </div>
+  </div>`;
+}
+
+function viewFotos(){
+  const photos=S.routine.map((step,index)=>({step,index}));
+  return `<div class="stack photo-library">
+    <div><h1>Suas fotos</h1><p class="muted">Personalize os cartões da rotina de ${esc(S.user.child)} com fotos da família ou do dia a dia.</p></div>
+    <div class="card stack photo-tip"><strong>Como funciona?</strong><p class="muted small">Escolha um passo e adicione uma foto. Ela aparecerá no cartão desse passo dentro da rotina.</p></div>
+    ${!hasAccess()?'<div class="card photo-tip"><strong>As fotos ficam guardadas</strong><p class="muted small">Para adicionar, trocar ou remover fotos, é necessário ter acesso ativo à plataforma.</p></div>':''}
+    ${photos.length?`<div class="photo-list">${photos.map(({step})=>`<article class="card photo-item">
+      ${pic(step,'photo-item-image')}
+      <div class="photo-item-copy"><strong>${esc(step.t)}</strong><span class="muted small">${step.photo?'Foto personalizada adicionada':'Usando o emoji do cartão'}</span></div>
+      <button class="btn ${step.photo?'':'primary'} photo-item-action" data-act="edit-card-photo" data-photo-step="${esc(step.id)}" ${hasAccess()?'':'disabled'}>${step.photo?'📷 Trocar foto':'＋ Adicionar foto'}</button>
+    </article>`).join('')}</div>`:`<div class="card stack" style="text-align:center;align-items:center"><span class="photo-empty-icon" aria-hidden="true">🗓️</span><h2>Adicione passos à rotina primeiro</h2><p class="muted">Depois, você poderá colocar fotos em cada cartão.</p><button class="btn primary" data-go="rotina">Abrir rotina</button></div>`}
+    <p class="muted small">Suas fotos ficam privadas e só são usadas nos cartões da sua conta.</p>
   </div>`;
 }
 
@@ -301,6 +522,7 @@ function extraTools(){
 
 function viewRotina(){
   const pending=S.routine.filter(r=>!r.done), now=pending[0], later=pending[1];
+  const unassigned=S.routine.some(r=>(r.period||'outro')==='outro');
   let top='';
   if(!S.routine.length)top=`<div class="card alldone"><div class="big">🗓️</div><h2>A rotina está vazia</h2><p class="muted">Adicione o primeiro passo do dia.</p><button class="btn primary" data-act="add-step">+ Adicionar passo</button></div>`;
   else if(!now)top=`<div class="card alldone"><div class="big">🌟</div><h2>Tudo pronto!</h2><p class="muted">Muito bem, ${esc(S.user.child)}.</p><div class="row" style="justify-content:center;margin-top:12px"><button class="btn" data-act="reset-day">↺ Recomeçar a rotina</button></div></div>`;
@@ -310,12 +532,14 @@ function viewRotina(){
     <div class="arrow" aria-hidden="true">→</div>
     ${later?`<div class="nl later"><div class="tag">Depois</div><button style="border:0;background:none;padding:0;width:100%;display:grid;place-items:center" data-say="${later.id}" aria-label="Ouvir: ${esc(later.t)}">${pic(later)}</button><div class="name">${esc(later.t)}</div></div>`:`<div class="nl later"><div class="tag">Depois</div><div class="pic">🎉</div><div class="name">Acabou!</div></div>`}
   </div>`;
-  const list=S.routine.map((r,i)=>`<div class="step${r.done?' done':''}">
+  const renderStep=r=>{const period=r.period||'outro',group=S.routine.filter(item=>(item.period||'outro')===period),groupIndex=group.findIndex(item=>item.id===r.id);
+    return `<div class="step${r.done?' done':''}">
     ${editing?'':`<button class="check" data-toggle="${r.id}" aria-pressed="${r.done}" aria-label="${r.done?'Desmarcar':'Marcar como feito'}: ${esc(r.t)}">${r.done?'✓':''}</button>`}
     ${pic(r)}<div class="t">${esc(r.t)}${r.audio?' <span class="muted small">🎙️</span>':''}</div>
-    ${editing?`<button class="mini" data-up="${i}" aria-label="Subir" ${i===0?'disabled':''}>↑</button><button class="mini" data-down="${i}" aria-label="Descer" ${i===S.routine.length-1?'disabled':''}>↓</button><button class="mini" data-edit="${r.id}" aria-label="Editar">✏️</button>`:`<button class="mini" data-say="${r.id}" aria-label="Ouvir">🔊</button>`}
-  </div>`).join('');
-  return kidBar('Rotina de '+esc(S.user.child))+top+(kid?'':`<div class="stack" style="margin-top:26px"><div class="row" style="justify-content:space-between"><div style="flex:1;min-width:200px"><h3>Sequência do dia</h3><p class="muted small">${S.routine.filter(r=>r.done).length} de ${S.routine.length} feitos</p><div class="progress" style="margin-top:8px;max-width:320px"><span style="width:${S.routine.length?S.routine.filter(r=>r.done).length/S.routine.length*100:0}%"></span></div></div>${editing?'<button class="btn primary" data-act="add-step">+ Adicionar passo</button>':`<button class="btn ghost" data-act="reset-day">↺ Recomeçar</button>`}</div><div class="steps">${list}</div></div>`);
+    ${editing?`<button class="mini" data-up="${r.id}" aria-label="Subir" ${groupIndex===0?'disabled':''}>↑</button><button class="mini" data-down="${r.id}" aria-label="Descer" ${groupIndex===group.length-1?'disabled':''}>↓</button><button class="mini" data-edit="${r.id}" aria-label="Editar">✏️</button>`:`<button class="mini" data-say="${r.id}" aria-label="Ouvir">🔊</button>`}
+  </div>`};
+  const list=PERIODS.map(([id,label,emoji])=>{const items=S.routine.filter(r=>(r.period||'outro')===id);return items.length?`<section class="routine-period"><h3>${emoji} ${label}</h3><div class="steps">${items.map(renderStep).join('')}</div></section>`:''}).join('');
+  return kidBar('Rotina de '+esc(S.user.child))+top+(kid?'':`<div class="stack routine-editor" style="margin-top:26px"><div class="row" style="justify-content:space-between"><div style="flex:1;min-width:200px"><h3>Sequência do dia</h3><p class="muted small">${S.routine.filter(r=>r.done).length} de ${S.routine.length} feitos</p><div class="progress" style="margin-top:8px;max-width:320px"><span style="width:${S.routine.length?S.routine.filter(r=>r.done).length/S.routine.length*100:0}%"></span></div></div>${editing?'<div class="row"><button class="btn" data-act="open-templates">📋 Usar modelo</button><button class="btn primary" data-act="add-step">+ Adicionar passo</button></div>':`<button class="btn ghost" data-act="reset-day">↺ Recomeçar</button>`}</div>${unassigned?'<p class="muted small">Passos antigos ficam em “Sem período”. Para organizá-los, entre em “Editar rotina” e escolha um período no lápis do cartão.</p>':''}${list||'<p class="muted">Ainda não há passos cadastrados.</p>'}</div>`);
 }
 
 let T={total:300,left:300,running:false,last:0,iv:0,ended:false};
@@ -410,6 +634,11 @@ function viewConta(){
    <label class="field">Nome da criança<input class="input" id="ac-child" value="${esc(S.user.child)}" ${hasAccess()?'':'readonly'}></label>
    <div class="seg" role="group" aria-label="Gênero da criança"><button type="button" id="ac-m" data-g2="m" aria-pressed="${!gi()}" ${hasAccess()?'':'disabled'}>Menino</button><button type="button" id="ac-f" data-g2="f" aria-pressed="${!!gi()}" ${hasAccess()?'':'disabled'}>Menina</button></div>
    <button class="btn primary" data-act="save-acct">Salvar</button></div>
+  <div class="card stack"><h3>Lembretes da rotina</h3><p class="muted small">Receba uma notificação diária no celular, mesmo com o app fechado. O aviso não mostra o nome da criança.</p>
+   <label class="field">Horário do lembrete<input class="input" id="reminder-time" type="time" value="${esc(S.reminders.time)}"></label>
+   <p class="muted small">${S.reminders.enabled?'Lembretes ativos às '+esc(S.reminders.time)+', enviados aos aparelhos cadastrados.':'Os lembretes estão desativados.'} O horário segue o fuso do seu dispositivo (${esc(S.reminders.timezone)}).</p>
+   ${cfg?.vapidPublicKey?`<button class="btn primary" data-act="enable-reminders">${S.reminders.enabled?'Salvar horário e manter ativo':'Cadastrar este aparelho e ativar lembretes'}</button>`:'<button class="btn primary" disabled>Notificações em preparação</button><p class="muted small">A ativação depende de configuração técnica do serviço de notificações.</p>'}
+   ${S.reminders.enabled?'<button class="btn ghost" data-act="disable-reminders">Desativar lembretes</button>':''}</div>
   <div class="card stack"><h3>Assinatura</h3><p>${S.plan?`Plano ${S.plan}, desde ${new Date(S.planAt).toLocaleDateString('pt-BR')}.`:daysLeft()>0?`Teste grátis: ${daysLeft()} ${daysLeft()===1?'dia restante':'dias restantes'}.`:'Teste grátis encerrado.'}</p>
    ${S.subscription?.status==='pendente'?'<p class="muted small">Aguardando confirmação do Mercado Pago.</p><button class="btn" data-act="refresh-subscription">Atualizar status</button>':''}
    ${S.subscription?.status==='pausada'?'<p class="muted small">Sua assinatura está pausada. Entre em contato com o suporte para retomá-la ou cancelá-la.</p>':''}
@@ -430,6 +659,22 @@ function viewAdmin(){
 /* ---------- modais ---------- */
 function modalHTML(){
   if(!modal)return '';
+  if(modal.type==='card-photo'){
+    const step=modal.step;
+    return `<div class="overlay" data-close="1"><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="card-photo-title"><div class="row" style="justify-content:space-between"><h2 id="card-photo-title">Foto do cartão</h2><button class="iconbtn" data-act="close" aria-label="Fechar">✕</button></div>
+      <p class="muted">Escolha uma foto para o cartão <strong>${esc(step.t)}</strong>.</p>
+      <div class="card-photo-preview">${step.photo?`<img src="${step.photo}" alt="Foto atual do cartão ${esc(step.t)}">`:`<span aria-hidden="true">${esc(step.e)}</span>`}</div>
+      <label class="btn filebtn primary">📷 ${step.photo?'Trocar foto':'Escolher foto'}<input type="file" id="card-photo-upload" accept="image/*"></label>
+      ${step.photo?'<button class="btn danger" data-act="remove-card-photo">Remover foto</button>':''}
+      <button class="btn primary big" data-act="save-card-photo" ${hasAccess()?'':'disabled'}>Salvar foto</button>
+    </div></div>`;
+  }
+  if(modal.type==='templates')return `<div class="overlay" data-close="1"><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="templates-title"><div class="row" style="justify-content:space-between"><h2 id="templates-title">Modelos de rotina</h2><button class="iconbtn" data-act="close" aria-label="Fechar">✕</button></div><p class="muted">O modelo será acrescentado à sua rotina. Passos iguais que já existem não serão repetidos.</p><div class="stack">${ROUTINE_TEMPLATES.map(template=>`<article class="card stack template-card"><div><h3>${esc(template.title)}</h3><p class="muted small">${esc(template.description)}</p></div><p class="small">${template.steps.map(([title])=>esc(title)).join(' · ')}</p><button class="btn primary" data-template="${template.id}">Adicionar modelo</button></article>`).join('')}</div></div></div>`;
+  if(modal.type==='appointment'){
+    const item=modal.item||{professional_type:'psicologo',appointment_at:`${calendarDate}T09:00:00`};
+    return `<div class="overlay" data-close="1"><div class="sheet" role="dialog" aria-modal="true" aria-labelledby="appointment-title"><div class="row" style="justify-content:space-between"><h2 id="appointment-title">${modal.item?'Editar atendimento':'Agendar atendimento'}</h2><button class="iconbtn" data-act="close" aria-label="Fechar">✕</button></div><p class="muted small">Agendamentos e dados de saúde são visíveis apenas nesta conta. As notificações não exibem o nome do profissional nem informações da criança.</p><label class="field">Profissional<select class="input" id="appointment-type">${APPOINTMENT_TYPES.map(([id,name])=>`<option value="${id}" ${item.professional_type===id?'selected':''}>${name}</option>`).join('')}</select></label><label class="field">Dia e horário<input class="input" id="appointment-datetime" type="datetime-local" value="${localDateTimeValue(item.appointment_at)}" required></label><div class="row"><button class="btn primary" id="save-appointment" data-act="save-appointment">Salvar agendamento</button><button class="btn ghost" data-act="close">Cancelar</button></div></div></div>`;
+  }
+  if(modal.type==='install')return `<div class="overlay" data-close="1"><div class="sheet install-guide" role="dialog" aria-modal="true" aria-labelledby="install-title"><div class="row" style="justify-content:space-between"><h2 id="install-title">Adicionar à tela inicial</h2><button class="iconbtn" data-act="close" aria-label="Fechar">✕</button></div><p class="muted">O navegador pode adicionar um ícone do Rotina Atípica à tela do celular para abrir o site como um aplicativo.</p><div class="card stack"><h3>Android</h3><p class="small">No Chrome, toque no menu <strong>⋮</strong> e escolha <strong>Instalar app</strong> ou <strong>Adicionar à tela inicial</strong>.</p></div><div class="card stack"><h3>iPhone ou iPad</h3><p class="small">Abra este site no Safari, toque em <strong>Compartilhar</strong> e escolha <strong>Adicionar à Tela de Início</strong>.</p></div><button class="btn primary big" data-act="close">Entendi</button></div></div>`;
   if(modal.type==='feel'){const f=FEEL.find(x=>x.id===modal.id);const a=S.feelAudio[f.id];
     return `<div class="overlay" data-close="1"><div class="bigshow" role="dialog" aria-modal="true" aria-label="${esc(feelPhrase(f))}"><div class="e" aria-hidden="true">${f.e}</div><div class="t">${esc(feelPhrase(f))}</div>
      <div class="row" style="justify-content:center"><button class="btn big" data-act="say-feel">🔊 Ouvir</button><button class="btn primary big" data-act="close">Pronto</button></div>
@@ -437,6 +682,7 @@ function modalHTML(){
   if(modal.type==='step'){const d=modal.d;
     return `<div class="overlay"><div class="sheet" role="dialog" aria-modal="true" aria-label="Passo da rotina"><div class="row" style="justify-content:space-between"><h2>${modal.isNew?'Novo passo':'Editar passo'}</h2><button class="iconbtn" data-act="close" aria-label="Fechar">✕</button></div>
      <div class="row">${pic(d,'')}<label class="field" style="flex:1;min-width:0">Nome do passo<input class="input" id="st-title" value="${esc(d.t)}" placeholder="Ex.: Escovar os dentes"></label></div>
+     <label class="field">Período do dia<select class="input" id="st-period">${PERIODS.map(([id,label])=>`<option value="${id}" ${(d.period||'outro')===id?'selected':''}>${label}</option>`).join('')}</select></label>
      <div class="stack" style="gap:8px"><span class="eyebrow">Escolha uma imagem</span><div class="emogrid">${LIB.map(([t,e])=>`<button data-pick="${e}" data-pickt="${esc(t)}" aria-label="${esc(t)}" aria-pressed="${!d.photo&&d.e===e}" title="${esc(t)}">${e}</button>`).join('')}</div></div>
      <div class="row"><label class="btn filebtn">📷 Usar foto própria<input type="file" id="st-photo" accept="image/*"></label>${d.photo?'<button class="btn ghost" data-act="del-photo">Tirar foto</button>':''}</div>
      <div class="stack" style="gap:8px"><span class="eyebrow">Sua voz neste cartão ${d.audio?'· gravada ✓':''}</span><div class="row">${recButtons('step')}${d.audio?'<button class="btn ghost" data-act="play-draft">▶ Ouvir</button><button class="btn ghost" data-act="del-audio">Apagar</button>':''}</div></div>
@@ -456,30 +702,56 @@ function recButtons(ctx){
 function render(){
   const root=document.getElementById('root');
   document.documentElement.classList.toggle('kid',kid);
-  if(!S){root.innerHTML=viewWelcome()+(modal&&modal.type==='legal'?legalModal():'');bindSignup();return}
+  if(recoveryMode){root.innerHTML=viewPasswordRecovery();bindPasswordRecovery();return}
+  if(!S){root.innerHTML=viewWelcome()+(modal?.type==='legal'?legalModal():modalHTML());bindSignup();return}
   const locked=['rotina','espera','sentimentos','escala'].includes(view)&&!hasAccess();
-  const body=locked?viewPaywall():({home:viewHome,rotina:viewRotina,espera:viewEspera,sentimentos:viewSentimentos,escala:viewEscala,planos:viewPlanos,ajuda:viewAjuda,privacidade:viewPrivacidade,conta:viewConta,admin:viewAdmin}[view]||viewHome)();
+  const body=locked?viewPaywall():({home:viewHome,rotina:viewRotina,espera:viewEspera,sentimentos:viewSentimentos,escala:viewEscala,calendario:viewCalendar,fotos:viewFotos,planos:viewPlanos,ajuda:viewAjuda,privacidade:viewPrivacidade,conta:viewConta,admin:viewAdmin}[view]||viewHome)();
   const navBtn=([v,i,l],cls)=>`<button class="${cls}" data-go="${v}" ${view===v?'aria-current="page"':''}><span class="i" aria-hidden="true">${i}</span>${l}</button>`;
   root.innerHTML=`<div class="shell">
    <nav class="side" aria-label="Menu"><button class="brand" data-go="home">${LOGO}Rotina Atípica</button>
     ${NAV.map(n=>navBtn(n,'nav')).join('')}<div class="sep"></div>
-    ${[['planos','⭐','Planos'],['ajuda','💬','Ajuda'],['conta','👤','Minha conta'],['admin','📊','Painel admin']].map(n=>navBtn(n,'nav')).join('')}
+    ${[['calendario','🩺','Consultas e terapias'],['fotos','📷','Suas fotos'],['planos','⭐','Planos'],['ajuda','💬','Ajuda'],['conta','👤','Minha conta'],['admin','📊','Painel admin']].map(n=>navBtn(n,'nav')).join('')}
     <div style="margin-top:auto;padding:8px">${trialChip()}</div></nav>
    <main class="main v-${view}">${kid?'':`<div class="top"><button class="brand" data-go="home">${LOGO}Rotina Atípica</button><div class="row" style="margin-left:auto">${trialChip()}<button class="iconbtn" data-go="conta" aria-label="Minha conta">👤</button></div></div>`}${body}</main>
    <nav class="bottom" aria-label="Menu">${NAV.map(n=>navBtn(n,'')).join('')}</nav></div>${modalHTML()}${toastMsg?`<div class="toast" role="status">${esc(toastMsg)}</div>`:''}`;
   bindHold();
 }
+function bindPasswordRecovery(){
+  const form=document.getElementById('new-password-form');if(!form)return;
+  form.addEventListener('submit',async event=>{
+    event.preventDefault();
+    const password=document.getElementById('new-password').value,error=document.getElementById('new-password-err');
+    error.hidden=true;
+    if(password.length<6){error.textContent='A senha precisa ter pelo menos 6 caracteres.';error.hidden=false;return}
+    if(password!==document.getElementById('confirm-password').value){error.textContent='As senhas não são iguais.';error.hidden=false;return}
+    const button=form.querySelector('[type=submit]');button.disabled=true;
+    try{
+      const {data,error:authError}=await sb.auth.updateUser({password});
+      if(authError)throw authError;
+      if(!data.user)throw new Error('Não foi possível confirmar sua conta. Abra novamente o link do e-mail.');
+      recoveryMode=false;history.replaceState(null,'',location.pathname+location.search);
+      await loadCloudState(data.user);view='home';render();toast('Senha atualizada com sucesso.');
+    }catch(err){error.textContent=err.message||'Não foi possível atualizar a senha.';error.hidden=false}
+    finally{button.disabled=false}
+  });
+}
 function legalModal(){return `<div class="overlay" data-close="1"><div class="sheet" role="dialog" aria-modal="true">${viewPrivacidade()}<button class="btn primary big" data-act="close">Fechar</button></div></div>`}
 
 let suGender='m';
 function bindSignup(){
-  const signup=document.getElementById('signup'),login=document.getElementById('login');if(!signup||!login)return;
+  const signup=document.getElementById('signup'),login=document.getElementById('login'),reset=document.getElementById('password-reset');if(!signup||!login||!reset)return;
   const show=(isLogin)=>{
-    signup.hidden=isLogin;login.hidden=!isLogin;
+    signup.hidden=isLogin;login.hidden=!isLogin;reset.hidden=true;
     (isLogin?document.getElementById('li-email'):document.getElementById('su-name')).focus();
   };
+  document.getElementById('show-reset').addEventListener('click',()=>{signup.hidden=true;login.hidden=true;reset.hidden=false;document.getElementById('reset-email').value=document.getElementById('li-email').value;document.getElementById('reset-email').focus()});
+  document.getElementById('back-login').addEventListener('click',()=>show(true));
   document.getElementById('show-login').addEventListener('click',()=>show(true));
   document.getElementById('show-signup').addEventListener('click',()=>show(false));
+  ['su-remember','li-remember'].forEach(id=>document.getElementById(id).addEventListener('change',event=>{
+    setRememberSession(event.target.checked);
+    ['su-remember','li-remember'].forEach(otherId=>document.getElementById(otherId).checked=rememberSession);
+  }));
   signup.addEventListener('submit',async e=>{e.preventDefault();
     const v=id=>document.getElementById(id).value.trim(), err=document.getElementById('su-err');
     let m='';
@@ -487,9 +759,10 @@ function bindSignup(){
     else if(v('su-pass').length<6)m='A senha precisa ter pelo menos 6 caracteres.';else if(!v('su-child'))m='Escreva o nome ou apelido da criança.';
     else if(!document.getElementById('su-terms').checked)m='Para continuar, aceite os termos e a política de privacidade.';
     if(m){err.textContent=m;err.hidden=false;return}
+    setRememberSession(document.getElementById('su-remember').checked);
     const button=signup.querySelector('[type=submit]');button.disabled=true;err.hidden=true;
     try{
-      const {data,error}=await sb.auth.signUp({email:v('su-email'),password:v('su-pass'),options:{emailRedirectTo:'https://herculesfreire300.github.io/Rotina-Atipica/',data:{nome:v('su-name'),nome_crianca:v('su-child'),genero_crianca:suGender}}});
+      const {data,error}=await sb.auth.signUp({email:v('su-email'),password:v('su-pass'),options:{emailRedirectTo:APP_URL,data:{nome:v('su-name'),nome_crianca:v('su-child'),genero_crianca:suGender}}});
       if(error)throw error;
       if(data.session){await loadCloudState(data.session.user);view='home';render();toast('Conta criada. Seus 7 dias grátis começaram hoje.')}
       else{
@@ -503,12 +776,26 @@ function bindSignup(){
   login.addEventListener('submit',async e=>{
     e.preventDefault();
     const button=login.querySelector('[type=submit]'),err=document.getElementById('li-err');
+    setRememberSession(document.getElementById('li-remember').checked);
     button.disabled=true;err.style.color='var(--s5)';err.hidden=true;
     try{
       const {data,error}=await sb.auth.signInWithPassword({email:document.getElementById('li-email').value.trim(),password:document.getElementById('li-pass').value});
       if(error)throw error;
       await loadCloudState(data.user);view='home';render();toast('Bem-vinda de volta.');
     }catch(error){err.textContent=error.message||'Não foi possível entrar.';err.hidden=false}
+    finally{button.disabled=false}
+  });
+  reset.addEventListener('submit',async event=>{
+    event.preventDefault();
+    const email=document.getElementById('reset-email').value.trim(),err=document.getElementById('reset-err'),button=reset.querySelector('[type=submit]');
+    err.style.color='var(--s5)';err.hidden=true;
+    if(!/^\S+@\S+\.\S+$/.test(email)){err.textContent='Confira o endereço de e-mail.';err.hidden=false;return}
+    button.disabled=true;
+    try{
+      const {error}=await sb.auth.resetPasswordForEmail(email,{redirectTo:APP_URL});
+      if(error)throw error;
+      err.style.color='var(--ok)';err.textContent='Se este e-mail estiver cadastrado, você receberá um link para redefinir a senha. Confira também a caixa de spam.';err.hidden=false;
+    }catch(error){err.textContent=error.message||'Não foi possível enviar o link de recuperação.';err.hidden=false}
     finally{button.disabled=false}
   });
 }
@@ -529,16 +816,49 @@ document.addEventListener('click',e=>{
   if(el.matches('[data-close]')&&e.target!==el)return;
   const d=el.dataset;
   if(d.close){modal=null;render();return}
+  if(d.act==='install-app'){installApp();return}
+  if(d.act==='edit-card-photo'){
+    const step=S.routine.find(item=>item.id===d.photoStep);
+    if(step){modal={type:'card-photo',step:{...step}};render()}
+    return;
+  }
+  if(d.act==='remove-card-photo'&&modal?.type==='card-photo'){
+    modal.step.photo=null;render();return;
+  }
+  if(d.act==='save-card-photo'&&modal?.type==='card-photo'){
+    if(!hasAccess()){toast('Para alterar as fotos, é necessário ter acesso ativo à plataforma.');return}
+    const index=S.routine.findIndex(item=>item.id===modal.step.id);
+    if(index<0){toast('Este passo não existe mais na rotina.');modal=null;render();return}
+    S.routine[index]={...S.routine[index],photo:modal.step.photo};
+    save();modal=null;render();toast('Foto do cartão salva.');return;
+  }
   if(d.legal){modal={type:'legal'};render();return}
   if(d.gender){suGender=d.gender;document.querySelectorAll('[data-gender]').forEach(b=>b.setAttribute('aria-pressed',b.dataset.gender===suGender));return}
   if(d.act==='retry-load'){boot();return}
   if(!S)return;
+  if(d.template){
+    const template=ROUTINE_TEMPLATES.find(item=>item.id===d.template);
+    if(!template)return;
+    const period=template.id==='tarde'?'tarde':template.id==='noite'?'noite':'manha';
+    const existing=new Set(S.routine.map(item=>(item.period||'outro')+'|'+item.t.trim().toLocaleLowerCase('pt-BR')));
+    const added=template.steps.filter(([title])=>!existing.has(period+'|'+title.toLocaleLowerCase('pt-BR'))).map(([t,e])=>({id:uid(),t,e,period,photo:null,audio:null,done:false}));
+    if(!added.length){toast('Esses passos já estão na rotina.');return}
+    S.routine.push(...added);save();modal=null;render();toast('Modelo adicionado à rotina.');return;
+  }
   if(d.g2){S.user.gender=d.g2;save();render();return}
   if(d.go){view=d.go;editing=false;modal=null;render();window.scrollTo(0,0);return}
+  if(d.monthStep){calendarMonth=new Date(calendarMonth.getFullYear(),calendarMonth.getMonth()+Number(d.monthStep),1);calendarDate=localDateKey(calendarMonth);render();return}
+  if(d.calendarDate){calendarDate=d.calendarDate;render();return}
+  if(d.appointmentEdit){const item=S.appointments.find(appointment=>appointment.id===d.appointmentEdit);if(item){modal={type:'appointment',item};render()}return}
+  if(d.appointmentDelete){deleteAppointment(d.appointmentDelete);return}
   if(d.say){const r=S.routine.find(x=>x.id===d.say);if(r)speak(r.t,r.audio);return}
   if(d.done){const r=S.routine.find(x=>x.id===d.done);r.done=true;save();const nx=S.routine.find(x=>!x.done);speak(nx?'Muito bem! Agora: '+nx.t:'Muito bem! Acabou a rotina.');render();return}
   if(d.toggle){const r=S.routine.find(x=>x.id===d.toggle);r.done=!r.done;save();render();return}
-  if(d.up||d.down){const i=+(d.up??d.down),j=d.up!==undefined?i-1:i+1;[S.routine[i],S.routine[j]]=[S.routine[j],S.routine[i]];save();render();return}
+  if(d.up||d.down){
+    const id=d.up||d.down,period=S.routine.find(item=>item.id===id)?.period||'outro',group=S.routine.filter(item=>(item.period||'outro')===period),index=group.findIndex(item=>item.id===id),target=group[index+(d.up?-1:1)];
+    if(target){const i=S.routine.findIndex(item=>item.id===id),j=S.routine.findIndex(item=>item.id===target.id);[S.routine[i],S.routine[j]]=[S.routine[j],S.routine[i]];save();render()}
+    return;
+  }
   if(d.edit){const r=S.routine.find(x=>x.id===d.edit);modal={type:'step',d:{...r},isNew:false};render();return}
   if(d.pick){modal.d.t=document.getElementById('st-title').value||'';if(!modal.d.t||LIB.some(([t])=>t===modal.d.t))modal.d.t=d.pickt;modal.d.e=d.pick;modal.d.photo=null;render();return}
   if(d.min){setWait(+d.min);render();return}
@@ -549,10 +869,13 @@ document.addEventListener('click',e=>{
   ({
    'kid':()=>{kid=true;editing=false;render();window.scrollTo(0,0)},
    'toggle-edit':()=>{editing=!editing;render()},
-   'add-step':()=>{modal={type:'step',d:{id:uid(),t:'',e:'⭐',photo:null,audio:null,done:false},isNew:true};render()},
+   'new-appointment':()=>{modal={type:'appointment'};render()},
+   'save-appointment':()=>saveAppointment(),
+   'add-step':()=>{modal={type:'step',d:{id:uid(),t:'',e:'⭐',period:'outro',photo:null,audio:null,done:false},isNew:true};render()},
+   'open-templates':()=>{modal={type:'templates'};render()},
    'reset-day':()=>{S.routine.forEach(r=>r.done=false);save();render()},
    'close':()=>{if(recState)recState.mr.stop();modal=null;render()},
-   'save-step':()=>{const t=document.getElementById('st-title').value.trim();if(!t){toast('Dê um nome para o passo.');return}modal.d.t=t;if(modal.isNew)S.routine.push(modal.d);else{const i=S.routine.findIndex(x=>x.id===modal.d.id);S.routine[i]=modal.d}save();modal=null;render();toast('Passo salvo.')},
+   'save-step':()=>{const t=document.getElementById('st-title').value.trim();if(!t){toast('Dê um nome para o passo.');return}modal.d.t=t;modal.d.period=document.getElementById('st-period').value;if(modal.isNew)S.routine.push(modal.d);else{const i=S.routine.findIndex(x=>x.id===modal.d.id);S.routine[i]=modal.d}save();modal=null;render();toast('Passo salvo.')},
    'del-step':()=>{S.routine=S.routine.filter(x=>x.id!==modal.d.id);save();modal=null;render();toast('Passo excluído.')},
    'del-photo':()=>{modal.d.photo=null;render()},
    'del-audio':()=>{modal.d.audio=null;render()},
@@ -573,12 +896,17 @@ document.addEventListener('click',e=>{
    'checkout-anual':()=>startCheckout('anual'),
    'cancel-subscription':()=>cancelSubscription(),
    'refresh-subscription':async()=>{try{await refreshSubscription();render();toast('Status da assinatura atualizado.')}catch(error){toast('Não foi possível atualizar: '+esc(error.message||error))}},
-   'sign-out':async()=>{try{await saveQueue;const {error}=await sb.auth.signOut();if(error)throw error}catch(error){toast('Não foi possível sair: '+esc(error.message||error))}},
+   'enable-reminders':()=>enableReminders(),
+   'disable-reminders':()=>disableReminders(),
+   'enable-appointment-reminders':()=>saveAppointmentReminders(true),
+   'disable-appointment-reminders':()=>saveAppointmentReminders(false),
+   'sign-out':async()=>{try{await saveQueue;await removeCurrentPushDevice();const {error}=await sb.auth.signOut();if(error)throw error}catch(error){toast('Não foi possível sair: '+esc(error.message||error))}},
    'copy-wa':()=>{navigator.clipboard.writeText(WA_SHOW).then(()=>toast('Número copiado.')).catch(()=>toast('Selecione o número para copiar.'))},
   }[a]||(()=>{}))();
 });
 document.addEventListener('change',e=>{
   const t=e.target,f=t.files&&t.files[0];if(!f)return;
+  if(t.id==='card-photo-upload'){readImage(f,u=>{if(modal?.type!=='card-photo')return;modal.step.photo=u;render()})}
   if(t.id==='st-photo'){modal.d.t=document.getElementById('st-title').value;readImage(f,u=>{modal.d.photo=u;render()})}
   if(t.id==='aud-step'){modal.d.t=document.getElementById('st-title').value;readFile(f,u=>{modal.d.audio=u;render();toast('Áudio adicionado.')})}
   if(t.id==='aud-feel'){readFile(f,u=>{S.feelAudio[modal.id]=u;save();render();toast('Áudio adicionado.')})}
