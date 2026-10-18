@@ -22,7 +22,7 @@ window.addEventListener('beforeinstallprompt',event=>{event.preventDefault();ins
 window.addEventListener('appinstalled',()=>{appInstalled=true;document.querySelectorAll('[data-install-card]').forEach(card=>card.hidden=true)});
 let cloudUser=null,cloudProfile=null,cloudChild=null,cloudBoards={},cloudReady=false,saveQueue=Promise.resolve();
 let mediaSlots=new Map(),mediaValues=new Map(),storedMediaPaths=new Set();
-let paymentBusy=false;
+let paymentBusy=false,audioGenerationBusy=false;
 function setRememberSession(remember){
   const current=authStorageKey&&(localStorage.getItem(authStorageKey)||sessionStorage.getItem(authStorageKey));
   rememberSession=remember;
@@ -46,7 +46,7 @@ const FEEL=[
  {id:'feliz',e:'😊',t:['Feliz','Feliz']},{id:'triste',e:'😢',t:['Triste','Triste']},{id:'raiva',e:'😠',t:['Com raiva','Com raiva']},
  {id:'medo',e:'😨',t:['Com medo','Com medo']},{id:'cansado',e:'🥱',t:['Cansado','Cansada']},{id:'calmo',e:'😌',t:['Calmo','Calma']},
  {id:'animado',e:'🤩',t:['Animado','Animada']},{id:'confuso',e:'😕',t:['Confuso','Confusa']},{id:'dor',e:'🤕',t:['Com dor','Com dor']},
- {id:'fome',e:'😋',t:['Com fome','Com fome']},{id:'barulho',e:'🙉',t:['Barulho demais','Barulho demais'],p:'Tem barulho demais'},
+ {id:'fome',e:'😋',t:['Com fome','Com fome']},{id:'barulho',e:'🙉',t:['Barulho demais','Barulho demais'],p:'Está barulhento demais para mim'},
  {id:'sozinho',e:'🫧',t:['Quero ficar sozinho','Quero ficar sozinha'],p:true}];
 const SCALE=[
  {n:1,c:'--s1',e:'😌',t:['Tranquilo','Tranquila'],h:['Continuar brincando','Receber um elogio']},
@@ -55,6 +55,41 @@ const SCALE=[
  {n:4,c:'--s4',e:'😣',t:['Muito nervoso','Muito nervosa'],h:['Ficar num lugar silencioso','Apertar a almofada','Adulto falando pouco e devagar']},
  {n:5,c:'--s5',e:'😫',t:['Explodindo','Explodindo'],h:['Ficar em segurança','Um adulto perto, em silêncio','Esperar passar, sem pressa']}];
 const WAITOPTS=[['Respirar','🌬️'],['Bichinho','🧸'],['Livro','📖'],['Desenhar','🖍️'],['Música','🎵'],['Contar até 10','🔢']];
+const WAIT_PHRASES=[
+ 'Enquanto espero, posso respirar.',
+ 'Enquanto espero, posso abraçar meu bichinho.',
+ 'Enquanto espero, posso olhar um livro.',
+ 'Enquanto espero, posso desenhar.',
+ 'Enquanto espero, posso ouvir música.',
+ 'Enquanto espero, posso contar até dez.'
+];
+const DEFAULT_AUDIO_FILES={
+ 'Estou feliz':'sentimento-feliz.mp3',
+ 'Estou triste':'sentimento-triste.mp3',
+ 'Estou com raiva':'sentimento-raiva.mp3',
+ 'Estou com medo':'sentimento-medo.mp3',
+ 'Estou cansado':'sentimento-cansado.mp3',
+ 'Estou cansada':'sentimento-cansada.mp3',
+ 'Estou calmo':'sentimento-calmo.mp3',
+ 'Estou calma':'sentimento-calma.mp3',
+ 'Estou animado':'sentimento-animado.mp3',
+ 'Estou animada':'sentimento-animada.mp3',
+ 'Estou confuso':'sentimento-confuso.mp3',
+ 'Estou confusa':'sentimento-confusa.mp3',
+ 'Estou com dor':'sentimento-dor.mp3',
+ 'Estou com fome':'sentimento-fome.mp3',
+ 'Está barulhento demais para mim':'sentimento-barulho.mp3',
+ 'Quero ficar sozinho':'sentimento-sozinho.mp3',
+ 'Quero ficar sozinha':'sentimento-sozinha.mp3',
+ 'Enquanto espero, posso respirar.':'espera-respirar.mp3',
+ 'Enquanto espero, posso abraçar meu bichinho.':'espera-bichinho.mp3',
+ 'Enquanto espero, posso olhar um livro.':'espera-livro.mp3',
+ 'Enquanto espero, posso desenhar.':'espera-desenhar.mp3',
+ 'Enquanto espero, posso ouvir música.':'espera-musica.mp3',
+ 'Enquanto espero, posso contar até dez.':'espera-contar.mp3',
+ 'A espera terminou.':'espera-terminou.mp3',
+ 'Pronto! A rotina terminou.':'rotina-terminou.mp3'
+};
 const PERIODS=[['manha','Manhã','🌅'],['tarde','Tarde','☀️'],['noite','Noite','🌙'],['outro','Sem período','🗓️']];
 const APPOINTMENT_TYPES=[['psicologo','Psicólogo(a)'],['to','Terapeuta ocupacional'],['fonoaudiologo','Fonoaudiólogo(a)'],['neuropediatra','Neuropediatra']];
 const ROUTINE_TEMPLATES=[
@@ -221,8 +256,35 @@ function feelPhrase(f){const w=f.t[gi()];if(f.p===true)return w;if(f.p)return f.
 let voices=[];
 function loadVoices(){try{voices=speechSynthesis.getVoices().filter(v=>/^pt/i.test(v.lang))}catch(e){}}
 try{loadVoices();speechSynthesis.onvoiceschanged=loadVoices}catch(e){}
-function tts(text){try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(text);u.lang='pt-BR';u.rate=.9;const v=voices.find(v=>v.lang==='pt-BR')||voices[0];if(v)u.voice=v;speechSynthesis.speak(u)}catch(e){}}
-function speak(text,audio){if(audio){const a=new Audio(audio);a.play().catch(()=>tts(text))}else tts(text)}
+let currentDefaultAudio=null;
+function browserTts(text){if(currentDefaultAudio){currentDefaultAudio.pause();currentDefaultAudio=null}try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(text);u.lang='pt-BR';u.rate=.9;const v=voices.find(v=>v.lang==='pt-BR')||voices[0];if(v)u.voice=v;speechSynthesis.speak(u)}catch(e){}}
+function playDefaultAudio(text){
+  const filename=DEFAULT_AUDIO_FILES[text]||DEFAULT_AUDIO_FILES[`${text}.`];
+  if(!filename||!sb)return false;
+  const url=sb.storage.from('audio-padrao').getPublicUrl(filename).data.publicUrl;
+  if(currentDefaultAudio){currentDefaultAudio.pause();currentDefaultAudio.currentTime=0}
+  try{speechSynthesis.cancel()}catch(e){}
+  const audio=new Audio(url);currentDefaultAudio=audio;
+  audio.onended=()=>{if(currentDefaultAudio===audio)currentDefaultAudio=null};
+  audio.play().catch(()=>{if(currentDefaultAudio===audio)browserTts(text)});
+  return true;
+}
+function tts(text){if(!playDefaultAudio(text))browserTts(text)}
+function speak(text,audio){
+  if(audio){if(currentDefaultAudio){currentDefaultAudio.pause();currentDefaultAudio=null}const a=new Audio(audio);a.play().catch(()=>tts(text));return}
+  tts(text);
+}
+async function generateDefaultAudio(){
+  if(audioGenerationBusy)return;
+  if(!window.confirm('Serão gerados somente os áudios padrão que ainda não existem. Cada arquivo novo consome créditos do ElevenLabs uma vez; os arquivos já gerados não serão cobrados novamente. Continuar?'))return;
+  audioGenerationBusy=true;render();
+  try{
+    const {data,error}=await sb.functions.invoke('gerar-audios-padrao',{body:{}});
+    if(error)throw error;
+    toast(`Áudios prontos: ${data.generated} gerados e ${data.existing} já existentes.`);
+  }catch(error){toast('Não foi possível preparar os áudios: '+(error.message||error))}
+  finally{audioGenerationBusy=false;render()}
+}
 let actx=null;
 function chime(){try{actx=actx||new (window.AudioContext||window.webkitAudioContext)();[523.25,659.25,783.99].forEach((f,i)=>{const o=actx.createOscillator(),g=actx.createGain();o.type='sine';o.frequency.value=f;const t=actx.currentTime+i*.35;g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(.18,t+.05);g.gain.exponentialRampToValueAtTime(.001,t+1.2);o.connect(g).connect(actx.destination);o.start(t);o.stop(t+1.3)})}catch(e){}}
 
@@ -548,7 +610,7 @@ function viewEspera(){
   if(!T.running&&T.left===T.total&&T.total!==S.waitMin*60){T.total=S.waitMin*60;T.left=T.total}
   return kidBar('Hora de esperar')+`<div class="timerwrap">
    <div class="card stack" style="align-items:center">
-    <div class="pie" id="pie" role="timer" style="--p:${T.left/T.total}"><div class="center"><div class="clock" id="clock">${fmt(T.left)}</div><div class="muted small" id="clocksub">${T.ended?'Acabou a espera!':T.running?'esperando…':'pronto para começar'}</div></div></div>
+    <div class="pie" id="pie" role="timer" style="--p:${T.left/T.total}"><div class="center"><div class="clock" id="clock">${fmt(T.left)}</div><div class="muted small" id="clocksub">${T.ended?'A espera terminou.':T.running?'esperando…':'pronto para começar'}</div></div></div>
     ${kid?'':`<div class="seg" role="group" aria-label="Minutos">${[1,2,3,5,10,15].map(m=>`<button data-min="${m}" aria-pressed="${S.waitMin===m}">${m} min</button>`).join('')}</div>`}
     <div class="row" style="justify-content:center">${T.running?'<button class="btn big" data-act="pause">⏸ Pausar</button>':`<button class="btn primary big" data-act="start">▶ ${T.left<T.total&&!T.ended?'Continuar':'Começar'}</button>`}${kid?'':'<button class="btn big" data-act="reset-t">↺</button>'}</div>
    </div>
@@ -561,7 +623,7 @@ function tick(){
   const n=performance.now();T.left=Math.max(0,T.left-(n-T.last)/1000);T.last=n;
   const pie=document.getElementById('pie'),cl=document.getElementById('clock');
   if(pie)pie.style.setProperty('--p',T.left/T.total);if(cl)cl.textContent=fmt(T.left);
-  if(T.left<=0){clearInterval(T.iv);T.running=false;T.ended=true;chime();setTimeout(()=>tts('Acabou a espera!'),1200);if(view==='espera')render()}
+  if(T.left<=0){clearInterval(T.iv);T.running=false;T.ended=true;chime();setTimeout(()=>tts('A espera terminou.'),1200);if(view==='espera')render()}
 }
 
 function viewSentimentos(){
@@ -653,7 +715,7 @@ function viewConta(){
 
 function viewAdmin(){
   if(cloudProfile.role!=='admin')return `<div class="card stack" style="max-width:520px"><p class="eyebrow">Área restrita</p><h2>Painel do administrador</h2><p class="muted">Esta conta não tem permissão de administradora.</p></div>`;
-  return `<div class="card stack" style="max-width:620px"><p class="eyebrow">Área administrativa</p><h1>Painel admin</h1><p class="muted">O banco está protegido e a função de resumo está pronta. Os indicadores do painel ainda não estão conectados à interface.</p></div>`;
+  return `<div class="stack" style="max-width:620px"><div class="card stack"><p class="eyebrow">Área administrativa</p><h1>Painel admin</h1><p class="muted">O banco está protegido e a função de resumo está pronta. Os indicadores do painel ainda não estão conectados à interface.</p></div><div class="card stack"><h2>Áudios padrão</h2><p class="muted">Gere uma vez as falas padrão com a voz configurada no ElevenLabs. Os arquivos ficam armazenados para reutilização e não incluem nomes ou textos personalizados.</p><p class="muted small">Cada arquivo ausente consome créditos uma vez. Áudios já preparados não são gerados novamente.</p><button class="btn primary" data-act="generate-default-audio" ${audioGenerationBusy?'disabled':''}>${audioGenerationBusy?'Preparando áudios…':'Preparar áudios padrão'}</button></div></div>`;
 }
 
 /* ---------- modais ---------- */
@@ -852,7 +914,7 @@ document.addEventListener('click',e=>{
   if(d.appointmentEdit){const item=S.appointments.find(appointment=>appointment.id===d.appointmentEdit);if(item){modal={type:'appointment',item};render()}return}
   if(d.appointmentDelete){deleteAppointment(d.appointmentDelete);return}
   if(d.say){const r=S.routine.find(x=>x.id===d.say);if(r)speak(r.t,r.audio);return}
-  if(d.done){const r=S.routine.find(x=>x.id===d.done);r.done=true;save();const nx=S.routine.find(x=>!x.done);speak(nx?'Muito bem! Agora: '+nx.t:'Muito bem! Acabou a rotina.');render();return}
+  if(d.done){const r=S.routine.find(x=>x.id===d.done);r.done=true;save();const nx=S.routine.find(x=>!x.done);speak(nx?'Pronto. Próximo passo: '+nx.t:'Pronto! A rotina terminou.');render();return}
   if(d.toggle){const r=S.routine.find(x=>x.id===d.toggle);r.done=!r.done;save();render();return}
   if(d.up||d.down){
     const id=d.up||d.down,period=S.routine.find(item=>item.id===id)?.period||'outro',group=S.routine.filter(item=>(item.period||'outro')===period),index=group.findIndex(item=>item.id===id),target=group[index+(d.up?-1:1)];
@@ -862,7 +924,7 @@ document.addEventListener('click',e=>{
   if(d.edit){const r=S.routine.find(x=>x.id===d.edit);modal={type:'step',d:{...r},isNew:false};render();return}
   if(d.pick){modal.d.t=document.getElementById('st-title').value||'';if(!modal.d.t||LIB.some(([t])=>t===modal.d.t))modal.d.t=d.pickt;modal.d.e=d.pick;modal.d.photo=null;render();return}
   if(d.min){setWait(+d.min);render();return}
-  if(d.wopt){S.waitPick=+d.wopt;save();tts('Enquanto espero, eu posso: '+WAITOPTS[+d.wopt][0]);render();return}
+  if(d.wopt){S.waitPick=+d.wopt;save();tts(WAIT_PHRASES[+d.wopt]);render();return}
   if(d.feel){modal={type:'feel',id:d.feel};const f=FEEL.find(x=>x.id===d.feel);render();speak(feelPhrase(f),S.feelAudio[f.id]);return}
   if(d.lvl){S.scalePick=+d.lvl;save();render();return}
   const a=d.act;if(!a)return;
@@ -889,6 +951,7 @@ document.addEventListener('click',e=>{
    'pause':()=>{tick();clearInterval(T.iv);T.running=false;render()},
    'reset-t':()=>{setWait(S.waitMin);render()},
    'say-lvl':()=>{const L=SCALE[S.scalePick-1];tts('Nível '+L.n+'. '+L.t[gi()]+'. O que me ajuda: '+S.helps[L.n-1].join(', '))},
+   'generate-default-audio':()=>generateDefaultAudio(),
    'edit-helps':()=>{modal={type:'helps'};render()},
    'save-helps':()=>{S.helps[S.scalePick-1]=document.getElementById('hp-text').value.split('\n').map(s=>s.trim()).filter(Boolean);save();modal=null;render();toast('Salvo.')},
    'save-acct':()=>{const v=id=>document.getElementById(id).value.trim();S.user.name=v('ac-name')||S.user.name;if(hasAccess())S.user.child=v('ac-child')||S.user.child;save();render();toast('Dados salvos.')},

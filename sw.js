@@ -1,8 +1,8 @@
-const CACHE_NAME = 'rotina-atipica-shell-v5';
+const CACHE_NAME = 'rotina-atipica-shell-v6';
 const SHELL_FILES = [
   './',
   './index.html',
-  './app.js?v=8',
+  './app.js?v=9',
   './style.css',
   './supabase-config.js?v=3',
   './manifest.webmanifest',
