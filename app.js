@@ -48,12 +48,22 @@ const FEEL=[
  {id:'animado',e:'🤩',t:['Animado','Animada']},{id:'confuso',e:'😕',t:['Confuso','Confusa']},{id:'dor',e:'🤕',t:['Com dor','Com dor']},
  {id:'fome',e:'😋',t:['Com fome','Com fome']},{id:'barulho',e:'🙉',t:['Barulho demais','Barulho demais'],p:'Está barulhento demais para mim'},
  {id:'sozinho',e:'🫧',t:['Quero ficar sozinho','Quero ficar sozinha'],p:true}];
+const LEGACY_SCALE_HELPS=[
+ ['Continuar brincando','Receber um elogio'],
+ ['Respirar fundo 3 vezes','Beber um copo de água'],
+ ['Abraçar o bichinho','Usar o fone contra barulho','Ir para o cantinho da calma'],
+ ['Ficar num lugar silencioso','Apertar a almofada','Adulto falando pouco e devagar'],
+ ['Ficar em segurança','Um adulto perto, em silêncio','Esperar passar, sem pressa']
+];
 const SCALE=[
  {n:1,c:'--s1',e:'😌',t:['Tranquilo','Tranquila'],h:['Continuar brincando','Receber um elogio']},
  {n:2,c:'--s2',e:'🙂',t:['Um pouco incomodado','Um pouco incomodada'],h:['Respirar fundo 3 vezes','Beber um copo de água']},
- {n:3,c:'--s3',e:'😐',t:['Incomodado','Incomodada'],h:['Abraçar o bichinho','Usar o fone contra barulho','Ir para o cantinho da calma']},
- {n:4,c:'--s4',e:'😣',t:['Muito nervoso','Muito nervosa'],h:['Ficar num lugar silencioso','Apertar a almofada','Adulto falando pouco e devagar']},
- {n:5,c:'--s5',e:'😫',t:['Explodindo','Explodindo'],h:['Ficar em segurança','Um adulto perto, em silêncio','Esperar passar, sem pressa']}];
+ {n:3,c:'--s3',e:'😐',t:['Incomodado','Incomodada'],h:['Abraçar meu bichinho','Usar fones abafadores de som','Ir para o cantinho da calma']},
+ {n:4,c:'--s4',e:'😣',t:['Muito nervoso','Muito nervosa'],h:['Ir para um lugar silencioso','Apertar a almofada','Ficar com um adulto que fale pouco e devagar']},
+ {n:5,c:'--s5',e:'😫',t:['Explodindo','Explodindo'],h:['Ficar em um lugar seguro','Ter um adulto por perto, em silêncio','Esperar passar, sem pressa']}];
+function migrateDefaultScaleHelps(helps){
+  return helps.map((items,index)=>LEGACY_SCALE_HELPS[index]&&JSON.stringify(items)===JSON.stringify(LEGACY_SCALE_HELPS[index])?SCALE[index].h.slice():items);
+}
 const WAITOPTS=[['Respirar','🌬️'],['Bichinho','🧸'],['Livro','📖'],['Desenhar','🖍️'],['Música','🎵'],['Contar até 10','🔢']];
 const WAIT_PHRASES=[
  'Enquanto espero, posso respirar.',
@@ -200,7 +210,7 @@ async function loadCloudState(user){
     waitMin:Number(configs.espera.waitMin)||base.waitMin,
     waitPick:configs.espera.waitPick??null,
     feelAudio:configs.sentimentos.feelAudio||{},
-    helps:Array.isArray(configs.escala.helps)?configs.escala.helps:base.helps,
+    helps:Array.isArray(configs.escala.helps)?migrateDefaultScaleHelps(configs.escala.helps):base.helps,
     scalePick:Number(configs.escala.scalePick)||base.scalePick,
     reminders:{enabled:reminderRow?.enabled||false,time:reminderRow?.reminder_time?.slice(0,5)||base.reminders.time,timezone:reminderRow?.timezone||localTimeZone()},
     appointmentRemindersEnabled:appointmentReminder?.enabled||false,appointments,
@@ -251,6 +261,12 @@ const gi=()=>S&&S.user.gender==='f'?1:0;
 const daysLeft=()=>Math.max(0,Math.ceil((new Date(cloudProfile.trial_ends_at).getTime()-Date.now())/DAY));
 const hasAccess=()=>!!S.plan||new Date(cloudProfile.trial_ends_at).getTime()>Date.now();
 function feelPhrase(f){const w=f.t[gi()];if(f.p===true)return w;if(f.p)return f.p;return 'Estou '+w.charAt(0).toLowerCase()+w.slice(1)}
+function scalePhrase(level,helps){
+  const state=level.n===5?'Está difícil para mim agora. Preciso ficar em segurança.':`Estou ${level.t[gi()].toLocaleLowerCase('pt-BR')}.`;
+  const options=helps.filter(Boolean);
+  const list=options.length>1?`${options.slice(0,-1).join(', ')} ou ${options[options.length-1]}`:(options[0]||'');
+  return `Nível ${level.n}. ${state} O que pode me ajudar?${list?' '+list+'.':''}`;
+}
 
 /* voz */
 let voices=[];
@@ -273,17 +289,6 @@ function tts(text){if(!playDefaultAudio(text))browserTts(text)}
 function speak(text,audio){
   if(audio){if(currentDefaultAudio){currentDefaultAudio.pause();currentDefaultAudio=null}const a=new Audio(audio);a.play().catch(()=>tts(text));return}
   tts(text);
-}
-async function generateDefaultAudio(){
-  if(audioGenerationBusy)return;
-  if(!window.confirm('Serão gerados somente os áudios padrão que ainda não existem. Cada arquivo novo consome créditos do ElevenLabs uma vez; os arquivos já gerados não serão cobrados novamente. Continuar?'))return;
-  audioGenerationBusy=true;render();
-  try{
-    const {data,error}=await sb.functions.invoke('gerar-audios-padrao',{body:{}});
-    if(error)throw error;
-    toast(`Áudios prontos: ${data.generated} gerados e ${data.existing} já existentes.`);
-  }catch(error){toast('Não foi possível preparar os áudios: '+(error.message||error))}
-  finally{audioGenerationBusy=false;render()}
 }
 let actx=null;
 function chime(){try{actx=actx||new (window.AudioContext||window.webkitAudioContext)();[523.25,659.25,783.99].forEach((f,i)=>{const o=actx.createOscillator(),g=actx.createGain();o.type='sine';o.frequency.value=f;const t=actx.currentTime+i*.35;g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(.18,t+.05);g.gain.exponentialRampToValueAtTime(.001,t+1.2);o.connect(g).connect(actx.destination);o.start(t);o.stop(t+1.3)})}catch(e){}}
@@ -353,6 +358,17 @@ async function cancelSubscription(){
     toast(pending?'Pagamento pendente cancelado.':'Assinatura cancelada. Você mantém o acesso até o fim do período pago.');
   }catch(error){toast(error.message||'Não foi possível cancelar a assinatura.')}
   finally{paymentBusy=false;render()}
+}
+async function generateDefaultAudio(){
+  if(audioGenerationBusy)return;
+  if(!window.confirm('Serão gerados somente os áudios padrão que ainda não existem. Cada arquivo novo consome créditos do ElevenLabs uma vez; os arquivos já gerados não serão cobrados novamente. Continuar?'))return;
+  audioGenerationBusy=true;render();
+  try{
+    const {data,error}=await sb.functions.invoke('gerar-audios-padrao',{body:{}});
+    if(error)throw error;
+    toast(`Áudios prontos: ${data.generated} gerados e ${data.existing} já existentes.`);
+  }catch(error){toast('Não foi possível preparar os áudios: '+(error.message||error))}
+  finally{audioGenerationBusy=false;render()}
 }
 
 function decodeVapidKey(value){
@@ -950,7 +966,7 @@ document.addEventListener('click',e=>{
    'start':()=>{if(T.ended||T.left<=0){T.left=T.total;T.ended=false}T.running=true;T.last=performance.now();clearInterval(T.iv);T.iv=setInterval(tick,250);try{actx=actx||new (window.AudioContext||window.webkitAudioContext)()}catch(e){}render()},
    'pause':()=>{tick();clearInterval(T.iv);T.running=false;render()},
    'reset-t':()=>{setWait(S.waitMin);render()},
-   'say-lvl':()=>{const L=SCALE[S.scalePick-1];tts('Nível '+L.n+'. '+L.t[gi()]+'. O que me ajuda: '+S.helps[L.n-1].join(', '))},
+   'say-lvl':()=>{const L=SCALE[S.scalePick-1];tts(scalePhrase(L,S.helps[L.n-1]))},
    'generate-default-audio':()=>generateDefaultAudio(),
    'edit-helps':()=>{modal={type:'helps'};render()},
    'save-helps':()=>{S.helps[S.scalePick-1]=document.getElementById('hp-text').value.split('\n').map(s=>s.trim()).filter(Boolean);save();modal=null;render();toast('Salvo.')},
