@@ -76,6 +76,16 @@ O checkout permanece desativado em `supabase-config.js` (`paymentsEnabled: false
 
 O token de acesso do Mercado Pago e o segredo HMAC são necessários para ativar a cobrança. O webhook busca o estado atual diretamente no Mercado Pago antes de atualizar o banco; o navegador não pode definir se uma assinatura está paga.
 
+## Áudios padrão com ElevenLabs
+
+As falas padrão fixas podem ser geradas uma vez com a voz autorizada e armazenadas no bucket público `audio-padrao`. A reprodução usa os arquivos salvos e não chama o ElevenLabs nem consome créditos novamente. Textos personalizados (como nomes de passos) continuam usando a voz do aparelho, a menos que a família grave um áudio próprio. As gravações próprias ficam no bucket privado `midia` e não são substituídas.
+
+1. Aplique `supabase/migrations/20260604000000_audio_padrao_publico.sql` para criar o bucket público somente de leitura.
+2. Configure nos secrets do Supabase `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `SUPABASE_SERVICE_ROLE_KEY` e `SUPABASE_ANON_KEY`. Use o ID da voz autorizada; nunca coloque a chave da API ou a `service_role` no frontend ou no repositório.
+3. Implante a função com `supabase functions deploy gerar-audios-padrao`.
+4. Entre no app com uma conta administradora, abra **Painel admin** e selecione **Preparar áudios padrão**. A função verifica quais arquivos já existem e só gera os ausentes; se houver uma falha parcial, pode ser executada novamente sem regenerar arquivos já salvos.
+5. O bucket público contém apenas as falas fixas listadas pela função. Não envie nomes de crianças nem texto personalizado para essa geração.
+
 ## Pendências antes de lançar
 
 - **Licença ARASAAC**: os pictogramas são CC BY-NC-SA, que não permite uso comercial. Para usar numa plataforma paga é preciso autorização do Governo de Aragão, ou usar outros pictogramas (ex.: emojis abertos como OpenMoji, desenhos próprios).
