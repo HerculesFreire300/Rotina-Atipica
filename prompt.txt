@@ -1,0 +1,45 @@
+Quero criar um web app (PWA) chamado "Rotina Atípica", para mães de crianças atípicas/autistas.
+
+OBJETIVO
+Ajudar a mãe a organizar a rotina da criança com recursos visuais, de forma simples, acolhedora e em português do Brasil. Inspirado nas funções do app Choiceworks, mas com visual, textos e conteúdo 100% próprios.
+
+STACK
+- Front-end: HTML, CSS e JavaScript (PWA instalável na tela inicial do celular, mobile-first)
+- Hospedagem: GitHub Pages
+- Domínio: rotinaatipica.com.br
+- Login e banco de dados: Supabase (e-mail e senha)
+- Pagamentos: Mercado Pago (assinaturas com renovação automática)
+
+FUNÇÕES PRINCIPAIS (versão 1)
+1. Quadro de rotina: sequência visual do dia ("agora" e "depois"), com pictogramas, fotos próprias e checklist.
+2. Quadro de espera: timer visual com opções do que a criança pode fazer enquanto espera.
+3. Quadro de sentimentos: a criança mostra como está se sentindo.
+4. Escala de sentimentos: mostra o tamanho da emoção e o que ajuda em cada nível.
+- Permitir que a mãe grave a própria voz nos cartões.
+- Pictogramas: usar ARASAAC (licença livre, com crédito).
+
+MODELO DE ACESSO
+- 7 dias grátis após o cadastro.
+- Depois: plano mensal R$ 14,90 ou plano anual R$ 119,90, via Mercado Pago.
+- Webhook do Mercado Pago atualiza o status da assinatura no Supabase; liberar ou bloquear acesso automaticamente.
+
+SUPORTE
+- Botão de WhatsApp para o número (65) 99308-5010, com mensagem pronta: "Olá, preciso de ajuda com o Rotina Atípica".
+
+LGPD
+- Página de política de privacidade e termos de uso.
+- Coletar apenas os dados necessários (dados de crianças).
+
+DESIGN
+- Visual acolhedor e calmo, cores suaves (com tons de azul), botões grandes, fácil de usar com uma mão.
+
+Comece propondo a estrutura de pastas e o esquema das tabelas no Supabase, e depois vamos construindo por etapas.
+
+PAINEL DE ADMINISTRADOR
+- Área restrita, acessível apenas ao meu usuário (papel "admin" no Supabase, protegido por regras de segurança RLS).
+- Mostrar: total de usuárias, usuárias em teste grátis, assinantes do plano mensal, assinantes do plano anual, cancelamentos, novas usuárias por dia/mês e faturamento do mês.
+- Lista de usuárias com nome, e-mail, data de cadastro, plano e status da assinatura.
+
+RESPONSIVIDADE
+- Layout mobile-first, funcionando bem em celular, tablet e computador.
+- Botões grandes, fontes legíveis e boa acessibilidade (contraste, leitores de tela).
