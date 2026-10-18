@@ -5,7 +5,7 @@ Plataforma web (acessada pelo navegador, com conta de usuária) de rotina visual
 ## O que já existe
 
 - `prototipo/index.html`: protótipo navegável de todas as telas da v1. Os dados ficam só no navegador; login, pagamento e banco ainda são simulados.
-- `supabase/schema.sql`: tabelas, regras de segurança (RLS), bucket de fotos e áudios, e funções do painel admin.
+- `schema.sql`: tabelas, regras de segurança (RLS), bucket de fotos e áudios, e funções do painel admin. Rode o conteúdo no SQL Editor do projeto Supabase antes de conectar o app.
 
 ## Telas da v1
 

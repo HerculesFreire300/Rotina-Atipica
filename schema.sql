@@ -1,6 +1,8 @@
 -- Rotina Atípica: esquema do banco (Supabase / Postgres)
 -- Rode no SQL Editor do Supabase. Todas as tabelas têm RLS: cada mãe só vê os próprios dados.
 
+begin;
+
 -- 1. Perfil da responsável (1 linha por usuária do auth.users)
 create table public.profiles (
   id            uuid primary key references auth.users(id) on delete cascade,
@@ -18,7 +20,8 @@ create table public.criancas (
   user_id    uuid not null references public.profiles(id) on delete cascade,
   nome       text not null,
   genero     text not null default 'm' check (genero in ('m','f')),
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  unique (id, user_id)
 );
 
 -- 3. Cartões (pictograma ARASAAC, emoji ou foto própria + voz gravada)
@@ -29,29 +32,34 @@ create table public.cartoes (
   arasaac_id    integer,          -- id do pictograma ARASAAC, quando usado
   imagem_path   text,             -- foto própria no Storage (bucket "midia")
   audio_path    text,             -- voz da mãe no Storage (bucket "midia")
-  created_at    timestamptz not null default now()
+  created_at    timestamptz not null default now(),
+  unique (id, user_id)
 );
 
 -- 4. Quadros: rotina, espera, sentimentos, escala
 create table public.quadros (
   id         uuid primary key default gen_random_uuid(),
   user_id    uuid not null references public.profiles(id) on delete cascade,
-  crianca_id uuid not null references public.criancas(id) on delete cascade,
+  crianca_id uuid not null,
   tipo       text not null check (tipo in ('rotina','espera','sentimentos','escala')),
   nome       text not null,
   config     jsonb not null default '{}'::jsonb,  -- ex.: minutos do timer, textos "o que ajuda" por nível
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  unique (id, user_id),
+  foreign key (crianca_id, user_id) references public.criancas(id, user_id) on delete cascade
 );
 
 -- 5. Itens de cada quadro (ordem + checklist do dia)
 create table public.quadro_itens (
   id         uuid primary key default gen_random_uuid(),
-  quadro_id  uuid not null references public.quadros(id) on delete cascade,
+  quadro_id  uuid not null,
   user_id    uuid not null references public.profiles(id) on delete cascade,
-  cartao_id  uuid not null references public.cartoes(id) on delete cascade,
+  cartao_id  uuid not null,
   ordem      integer not null default 0,
   feito_em   date,                -- data em que foi marcado como feito (checklist)
-  nivel      smallint check (nivel between 1 and 5)  -- usado na escala
+  nivel      smallint check (nivel between 1 and 5),  -- usado na escala
+  foreign key (quadro_id, user_id) references public.quadros(id, user_id) on delete cascade,
+  foreign key (cartao_id, user_id) references public.cartoes(id, user_id) on delete cascade
 );
 
 -- 6. Assinaturas (atualizadas pelo webhook do Mercado Pago)
@@ -99,9 +107,10 @@ $$;
 -- Tem acesso? (teste grátis válido ou assinatura ativa)
 create function public.tem_acesso(uid uuid default auth.uid()) returns boolean
 language sql stable security definer set search_path = public as $$
-  select exists (select 1 from public.profiles p where p.id = uid and p.trial_ends_at > now())
+  select (uid = auth.uid() or public.is_admin())
+      and (exists (select 1 from public.profiles p where p.id = uid and p.trial_ends_at > now())
       or exists (select 1 from public.assinaturas a where a.user_id = uid
-                 and a.status = 'ativa' and (a.periodo_fim is null or a.periodo_fim > now()));
+                 and a.status = 'ativa' and (a.periodo_fim is null or a.periodo_fim > now())));
 $$;
 
 -- RLS
@@ -116,8 +125,7 @@ alter table public.pagamentos   enable row level security;
 -- Perfil: a própria usuária lê e edita (sem poder mudar role/trial); admin lê todos
 create policy "perfil proprio leitura" on public.profiles for select using (id = auth.uid() or public.is_admin());
 create policy "perfil proprio edicao" on public.profiles for update using (id = auth.uid())
-  with check (id = auth.uid() and role = (select role from public.profiles where id = auth.uid())
-              and trial_ends_at = (select trial_ends_at from public.profiles where id = auth.uid()));
+  with check (id = auth.uid());
 
 -- Dados da criança e dos quadros: só a dona, e só com acesso liberado para escrever
 create policy "criancas dona" on public.criancas for select using (user_id = auth.uid());
@@ -135,7 +143,7 @@ create policy "pagamentos leitura" on public.pagamentos for select using (user_i
 
 -- Storage: bucket privado "midia", arquivos em midia/<user_id>/...
 insert into storage.buckets (id, name, public) values ('midia','midia', false) on conflict do nothing;
-create policy "midia dona" on storage.objects for all
+create policy "midia dona" on storage.objects for all to authenticated
   using (bucket_id = 'midia' and (storage.foldername(name))[1] = auth.uid()::text)
   with check (bucket_id = 'midia' and (storage.foldername(name))[1] = auth.uid()::text);
 
@@ -165,5 +173,24 @@ create view public.admin_usuarias with (security_invoker = true) as
   left join lateral (select plano, status from assinaturas where user_id = p.id order by created_at desc limit 1) a on true;
 -- security_invoker: a view respeita o RLS, então só o admin enxerga todas as linhas.
 
+-- Permissões explícitas para a Data API; RLS continua controlando cada linha.
+revoke all on public.profiles, public.criancas, public.cartoes, public.quadros,
+  public.quadro_itens, public.assinaturas, public.pagamentos from anon, authenticated;
+revoke all on public.admin_usuarias from public, anon, authenticated;
+grant select on public.profiles, public.assinaturas, public.pagamentos to authenticated;
+grant update (nome) on public.profiles to authenticated;
+grant select, insert, update, delete on public.criancas, public.cartoes, public.quadros,
+  public.quadro_itens to authenticated;
+grant select on public.admin_usuarias to authenticated;
+
+revoke all on function public.handle_new_user() from public, anon, authenticated;
+revoke all on function public.is_admin() from public, anon;
+revoke all on function public.tem_acesso(uuid) from public, anon;
+revoke all on function public.admin_resumo() from public, anon;
+grant execute on function public.is_admin(), public.tem_acesso(uuid),
+  public.admin_resumo() to authenticated;
+
 -- Depois de criar sua conta, torne-se admin (troque o e-mail):
 -- update public.profiles set role = 'admin' where email = 'seu-email@exemplo.com';
+
+commit;
